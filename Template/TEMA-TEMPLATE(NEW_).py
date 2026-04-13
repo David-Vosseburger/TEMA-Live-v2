@@ -47,6 +47,9 @@ class BacktestConfig:
     hmm_min_risk_on_share: float = 0.30
     hmm_max_risk_on_share: float = 0.80
     hmm_min_risk_on_states: int = 2
+    hmm_risk_on_mode: str = "top_k"  # one of: top_k, positive, threshold
+    hmm_risk_on_top_k: int = 2
+    hmm_risk_on_threshold: float = 0.0
 
 
 def resolve_max_workers(cfg: BacktestConfig) -> int:
@@ -818,7 +821,16 @@ def apply_hmm_regime_filter_oos(
         trans_sticky=cfg.hmm_trans_sticky,
     )
 
-    risk_on_states = np.where(means > 0.0)[0]
+    mode = str(cfg.hmm_risk_on_mode).strip().lower()
+    if mode == "top_k":
+        k = max(1, min(int(cfg.hmm_risk_on_top_k), n_states_eff))
+        order = np.argsort(means)[::-1]
+        risk_on_states = order[:k].astype(np.int32)
+    elif mode == "threshold":
+        risk_on_states = np.where(means >= float(cfg.hmm_risk_on_threshold))[0].astype(np.int32)
+    else:
+        risk_on_states = np.where(means > 0.0)[0].astype(np.int32)
+
     if risk_on_states.size == 0:
         risk_on_states = np.array([int(np.argmax(means))], dtype=np.int32)
 
@@ -842,6 +854,8 @@ def apply_hmm_regime_filter_oos(
         "train_risk_on_share": float(train_mask.mean()) if train_mask.size else np.nan,
         "test_risk_on_share": float(test_mask.mean()) if test_mask.size else np.nan,
         "n_risk_on_states": float(risk_on_states.size),
+        "risk_on_states": ",".join(str(int(x)) for x in risk_on_states.tolist()),
+        "risk_on_mode": mode,
     }
     return filtered_train, filtered_test, state_df, diag
 
