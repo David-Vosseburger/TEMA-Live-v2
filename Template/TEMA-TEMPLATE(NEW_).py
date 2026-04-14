@@ -55,13 +55,16 @@ class BacktestConfig:
     rf_random_state: int = 42
     ml_prob_threshold: float = 0.55
     ml_auto_threshold: bool = True
-    ml_target_exposure: float = 0.50
+    ml_target_exposure: float = 0.40
 
     # Vol-target scaling (train-based)
     vol_target_enabled: bool = True
     vol_target_annual: float = 0.10
     vol_target_max_leverage: float = 12.0
     vol_target_min_leverage: float = 0.25
+    # Which series to reference for realized train volatility when computing vol-target scalar.
+    # Accepted values: "ml" (use ML-filtered train returns) or "bl" (use BL train returns).
+    vol_target_reference: str = "ml"
 
     ml_grid_search_enabled: bool = True
     ml_grid_rf_n_estimators: Tuple[int, ...] = (200, 400)
@@ -955,6 +958,7 @@ def compute_and_apply_vol_target(
     """
     Compute a scalar from realized train volatility and apply to both train and test portfolios.
 
+    Reference selection configurable via cfg.vol_target_reference ("ml" or "bl").
     Returns scaled (train_port_rets, test_port_rets, ml_train_rets, ml_test_rets) and diagnostics dict.
     """
     diag: Dict[str, object] = {}
@@ -962,19 +966,39 @@ def compute_and_apply_vol_target(
         diag["enabled"] = False
         return train_port_rets, test_port_rets, ml_train_rets, ml_test_rets, diag
 
+    # Decide which train series to use as the reference for realized volatility
+    ref_raw = getattr(cfg, "vol_target_reference", "ml")
+    ref = str(ref_raw).lower() if ref_raw is not None else "ml"
+    fallback_used = False
+
+    if ref == "ml":
+        # Prefer ML-filtered train returns when requested and available
+        if ml_train_rets is not None and not ml_train_rets.empty:
+            reference_series = ml_train_rets
+        else:
+            reference_series = train_port_rets
+            fallback_used = True
+    elif ref == "bl":
+        reference_series = train_port_rets
+    else:
+        # Invalid config value: fallback to BL and mark fallback
+        reference_series = train_port_rets
+        fallback_used = True
+
     # Realized train volatility (annualized) using 252 trading days
-    realized_train_vol = float(train_port_rets.std(ddof=0) * np.sqrt(252.0)) if not train_port_rets.empty else float(0.0)
+    reference_train_vol = float(reference_series.std(ddof=0) * np.sqrt(252.0)) if not reference_series.empty else float(0.0)
     target_vol = float(cfg.vol_target_annual)
 
     unclipped_scalar = None
     clipped = False
-    if realized_train_vol <= 1e-12 or not np.isfinite(realized_train_vol):
-        # Degenerate case: no variation in train returns. Use safety cap and mark clipping.
+
+    if reference_train_vol <= 1e-12 or not np.isfinite(reference_train_vol):
+        # Degenerate case: no variation in reference train returns. Use safety cap and mark clipping.
         unclipped_scalar = float(cfg.vol_target_max_leverage)
         scalar = float(cfg.vol_target_max_leverage)
         clipped = True
     else:
-        unclipped_scalar = float(target_vol / realized_train_vol)
+        unclipped_scalar = float(target_vol / reference_train_vol)
         scalar = float(np.clip(unclipped_scalar, cfg.vol_target_min_leverage, cfg.vol_target_max_leverage))
         clipped = not np.isclose(unclipped_scalar, scalar)
 
@@ -986,9 +1010,11 @@ def compute_and_apply_vol_target(
 
     diag = {
         "enabled": True,
+        "reference": ref,
+        "reference_train_vol": float(reference_train_vol),
+        "fallback_used": bool(fallback_used),
         "scalar": float(scalar),
         "unclipped_scalar": float(unclipped_scalar),
-        "realized_train_vol": float(realized_train_vol),
         "target_vol": float(target_vol),
         "min_leverage": float(cfg.vol_target_min_leverage),
         "max_leverage": float(cfg.vol_target_max_leverage),
