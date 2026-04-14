@@ -40,7 +40,7 @@ class BacktestConfig:
     bl_tau: float = 0.05
     bl_delta: float = 2.5
     bl_omega_scale: float = 0.25
-    bl_max_weight: float = 0.05
+    bl_max_weight: float = 0.15
 
     # C++ HMM feature generator + RF classifier
     ml_enabled: bool = True
@@ -55,7 +55,13 @@ class BacktestConfig:
     rf_random_state: int = 42
     ml_prob_threshold: float = 0.55
     ml_auto_threshold: bool = True
-    ml_target_exposure: float = 0.15
+    ml_target_exposure: float = 0.50
+
+    # Vol-target scaling (train-based)
+    vol_target_enabled: bool = True
+    vol_target_annual: float = 0.10
+    vol_target_max_leverage: float = 12.0
+    vol_target_min_leverage: float = 0.25
 
     ml_grid_search_enabled: bool = True
     ml_grid_rf_n_estimators: Tuple[int, ...] = (200, 400)
@@ -939,6 +945,59 @@ def evaluate_weighted_portfolio(
     return portfolio_returns, metrics
 
 
+def compute_and_apply_vol_target(
+    cfg: BacktestConfig,
+    train_port_rets: pd.Series,
+    test_port_rets: pd.Series,
+    ml_train_rets: pd.Series,
+    ml_test_rets: pd.Series,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, Dict[str, object]]:
+    """
+    Compute a scalar from realized train volatility and apply to both train and test portfolios.
+
+    Returns scaled (train_port_rets, test_port_rets, ml_train_rets, ml_test_rets) and diagnostics dict.
+    """
+    diag: Dict[str, object] = {}
+    if not bool(getattr(cfg, "vol_target_enabled", False)):
+        diag["enabled"] = False
+        return train_port_rets, test_port_rets, ml_train_rets, ml_test_rets, diag
+
+    # Realized train volatility (annualized) using 252 trading days
+    realized_train_vol = float(train_port_rets.std(ddof=0) * np.sqrt(252.0)) if not train_port_rets.empty else float(0.0)
+    target_vol = float(cfg.vol_target_annual)
+
+    unclipped_scalar = None
+    clipped = False
+    if realized_train_vol <= 1e-12 or not np.isfinite(realized_train_vol):
+        # Degenerate case: no variation in train returns. Use safety cap and mark clipping.
+        unclipped_scalar = float(cfg.vol_target_max_leverage)
+        scalar = float(cfg.vol_target_max_leverage)
+        clipped = True
+    else:
+        unclipped_scalar = float(target_vol / realized_train_vol)
+        scalar = float(np.clip(unclipped_scalar, cfg.vol_target_min_leverage, cfg.vol_target_max_leverage))
+        clipped = not np.isclose(unclipped_scalar, scalar)
+
+    # Apply scalar to both train and test portfolio returns and ML filtered returns
+    scaled_train = train_port_rets * scalar
+    scaled_test = test_port_rets * scalar
+    scaled_ml_train = ml_train_rets * scalar
+    scaled_ml_test = ml_test_rets * scalar
+
+    diag = {
+        "enabled": True,
+        "scalar": float(scalar),
+        "unclipped_scalar": float(unclipped_scalar),
+        "realized_train_vol": float(realized_train_vol),
+        "target_vol": float(target_vol),
+        "min_leverage": float(cfg.vol_target_min_leverage),
+        "max_leverage": float(cfg.vol_target_max_leverage),
+        "clipped": bool(bool(clipped)),
+    }
+
+    return scaled_train, scaled_test, scaled_ml_train, scaled_ml_test, diag
+
+
 def save_equity_curve_chart(
     series_map: Dict[str, pd.Series],
     out_path: Path,
@@ -1424,6 +1483,30 @@ def main() -> None:
             pd.DataFrame({"p": ml_test_rets}),
             pd.Series({"p": 1.0}),
         )
+
+    # Apply vol-target scaling (train-based) if enabled. This will scale both train/test and ML-filtered portfolios
+    scaled_train, scaled_test, scaled_ml_train, scaled_ml_test, vol_diag = compute_and_apply_vol_target(
+        cfg=cfg,
+        train_port_rets=train_port_rets,
+        test_port_rets=test_port_rets,
+        ml_train_rets=ml_train_rets,
+        ml_test_rets=ml_test_rets,
+    )
+
+    # Replace variables with scaled versions so subsequent metrics and CSVs reflect scaling
+    train_port_rets = scaled_train
+    test_port_rets = scaled_test
+    ml_train_rets = scaled_ml_train
+    ml_test_rets = scaled_ml_test
+
+    # Recompute portfolio-level metrics after scaling
+    _, train_metrics = evaluate_weighted_portfolio(pd.DataFrame({"p": train_port_rets}), pd.Series({"p": 1.0}))
+    _, test_metrics = evaluate_weighted_portfolio(pd.DataFrame({"p": test_port_rets}), pd.Series({"p": 1.0}))
+    _, ml_train_metrics = evaluate_weighted_portfolio(pd.DataFrame({"p": ml_train_rets}), pd.Series({"p": 1.0}))
+    _, ml_test_metrics = evaluate_weighted_portfolio(pd.DataFrame({"p": ml_test_rets}), pd.Series({"p": 1.0}))
+
+    # Persist diagnostics about the vol-target scaling
+    pd.DataFrame([vol_diag]).to_csv(here / "vol_target_diagnostics.csv", index=False)
 
     out_summary = here / "asset_strategy_summary.csv"
     out_weights = here / "black_litterman_weights.csv"
