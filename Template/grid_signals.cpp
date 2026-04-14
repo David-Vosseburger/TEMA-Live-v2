@@ -16,13 +16,19 @@ extern "C" void build_signals_batch(
     uint8_t* out_entries,       // shape: [n_rows, n_combos], row-major
     uint8_t* out_exits          // shape: [n_rows, n_combos], row-major
 ) {
-    (void)n_periods;
-
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < n_combos; ++j) {
         const int p1 = idx1[j];
         const int p2 = idx2[j];
         const int p3 = idx3[j];
+
+        if (p1 < 0 || p2 < 0 || p3 < 0 || p1 >= n_periods || p2 >= n_periods || p3 >= n_periods) {
+            for (int t = 0; t < n_rows; ++t) {
+                out_entries[t * n_combos + j] = 0;
+                out_exits[t * n_combos + j] = 0;
+            }
+            continue;
+        }
 
         bool prev_entry_raw = false;
         bool prev_exit_raw = false;

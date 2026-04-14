@@ -1,14 +1,19 @@
 import ctypes
+import itertools
 import os
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 
 
 @dataclass
@@ -26,6 +31,10 @@ class BacktestConfig:
     max_assets: Optional[int] = None
     verify_cpp_parity: bool = False
     parity_sample_size: int = 100
+    grid_validation_ratio: float = 0.25
+    grid_validation_shortlist: int = 200
+    grid_validation_min_rows: int = 80
+    grid_overfit_penalty: float = 0.5
 
     # Black-Litterman parameters
     bl_tau: float = 0.05
@@ -33,23 +42,27 @@ class BacktestConfig:
     bl_omega_scale: float = 0.25
     bl_max_weight: float = 0.05
 
-    # HMM regime filter (C++)
-    hmm_enabled: bool = True
+    # C++ HMM feature generator + RF classifier
+    ml_enabled: bool = True
     hmm_n_states: int = 3
     hmm_n_iter: int = 30
     hmm_var_floor: float = 1e-8
     hmm_trans_sticky: float = 0.92
-    hmm_sweep_enabled: bool = True
-    hmm_sweep_min_states: int = 2
-    hmm_sweep_max_states: int = 6
-    hmm_validation_ratio: float = 0.25
-    hmm_cv_folds: int = 3
-    hmm_min_risk_on_share: float = 0.30
-    hmm_max_risk_on_share: float = 0.80
-    hmm_min_risk_on_states: int = 2
-    hmm_risk_on_mode: str = "top_k"  # one of: top_k, positive, threshold
-    hmm_risk_on_top_k: int = 2
-    hmm_risk_on_threshold: float = 0.0
+
+    rf_n_estimators: int = 300
+    rf_max_depth: int = 6
+    rf_min_samples_leaf: int = 40
+    rf_random_state: int = 42
+    ml_prob_threshold: float = 0.55
+    ml_auto_threshold: bool = True
+    ml_target_exposure: float = 0.15
+
+    ml_grid_search_enabled: bool = True
+    ml_grid_rf_n_estimators: Tuple[int, ...] = (200, 400)
+    ml_grid_rf_max_depth: Tuple[int, ...] = (4, 6, 8)
+    ml_grid_rf_min_samples_leaf: Tuple[int, ...] = (20, 40, 80)
+    ml_grid_target_exposure: Tuple[float, ...] = (0.10, 0.15, 0.20)
+    ml_grid_hmm_n_states: Tuple[int, ...] = (2, 3, 4)
 
 
 def resolve_max_workers(cfg: BacktestConfig) -> int:
@@ -131,6 +144,23 @@ class CppHmmEngine:
         ]
         self.fn.restype = ctypes.c_int
 
+        self.fn_probs = self.lib.fit_hmm_forward_probs_1d
+        self.fn_probs.argtypes = [
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        self.fn_probs.restype = ctypes.c_int
+
     def fit_predict(
         self,
         train_returns: np.ndarray,
@@ -167,6 +197,43 @@ class CppHmmEngine:
             raise RuntimeError(f"C++ HMM fit failed with code {rc}")
 
         return train_states, test_states, means, variances
+
+    def fit_forward_probs(
+        self,
+        train_returns: np.ndarray,
+        test_returns: np.ndarray,
+        n_states: int,
+        n_iter: int,
+        var_floor: float,
+        trans_sticky: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        train_arr = np.ascontiguousarray(train_returns, dtype=np.float64)
+        test_arr = np.ascontiguousarray(test_returns, dtype=np.float64)
+
+        train_probs = np.zeros((train_arr.shape[0], n_states), dtype=np.float64)
+        test_probs = np.zeros((test_arr.shape[0], n_states), dtype=np.float64)
+        means = np.zeros(n_states, dtype=np.float64)
+        variances = np.zeros(n_states, dtype=np.float64)
+
+        rc = self.fn_probs(
+            train_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            int(train_arr.shape[0]),
+            test_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            int(test_arr.shape[0]),
+            int(n_states),
+            int(n_iter),
+            float(var_floor),
+            float(trans_sticky),
+            train_probs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            test_probs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            means.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            variances.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        )
+
+        if rc != 0:
+            raise RuntimeError(f"C++ HMM forward probs failed with code {rc}")
+
+        return train_probs, test_probs, means, variances
 
 
 def compile_cpp_signal_library(cpp_path: Path) -> Path:
@@ -269,12 +336,22 @@ def simulate_batch_returns_and_stats(
     entry_count = np.zeros(n_combos, dtype=np.int32)
     exit_count = np.zeros(n_combos, dtype=np.int32)
 
+    trade_open = np.zeros(n_combos, dtype=bool)
+    trade_ret_running = np.zeros(n_combos, dtype=np.float64)
+    trade_closed_count = np.zeros(n_combos, dtype=np.int32)
+    trade_win_count = np.zeros(n_combos, dtype=np.int32)
+    trade_gain_sum = np.zeros(n_combos, dtype=np.float64)
+    trade_loss_sum_abs = np.zeros(n_combos, dtype=np.float64)
+    trade_ret_sum = np.zeros(n_combos, dtype=np.float64)
+
     for t in range(1, n_rows):
         strat_rets[t, :] = pos * ret_px[t]
 
         new_pos = pos.copy()
         ex = exits_np[t, :]
         en = entries_np[t, :]
+
+        # If entry and exit happen on the same bar, entry wins by design.
         new_pos[ex] = 0
         new_pos[en] = 1
 
@@ -283,6 +360,37 @@ def simulate_batch_returns_and_stats(
 
         entry_count += (new_pos > pos).astype(np.int32)
         exit_count += (new_pos < pos).astype(np.int32)
+
+        entering = (new_pos > pos)
+        staying = trade_open & (new_pos > 0)
+        closing = trade_open & (new_pos == 0)
+
+        trade_ret_running[entering] = strat_rets[t, entering]
+        trade_open[entering] = True
+
+        carry = staying & ~entering
+        trade_ret_running[carry] += strat_rets[t, carry]
+
+        trade_ret_running[closing] += strat_rets[t, closing]
+        if np.any(closing):
+            closed_vals = trade_ret_running[closing]
+            trade_closed_count[closing] += 1
+            trade_ret_sum[closing] += closed_vals
+
+            wins = closed_vals > 0.0
+            losses = closed_vals < 0.0
+
+            idxs = np.where(closing)[0]
+            if idxs.size > 0:
+                win_idxs = idxs[wins]
+                loss_idxs = idxs[losses]
+                trade_win_count[win_idxs] += 1
+                trade_gain_sum[win_idxs] += closed_vals[wins]
+                trade_loss_sum_abs[loss_idxs] += np.abs(closed_vals[losses])
+
+            trade_open[closing] = False
+            trade_ret_running[closing] = 0.0
+
         pos = new_pos
 
     periods = periods_per_year(freq)
@@ -312,32 +420,44 @@ def simulate_batch_returns_and_stats(
     max_drawdown = np.nanmin(dd, axis=0)
     ulcer_index = np.sqrt(np.nanmean(np.square(dd), axis=0))
 
-    pos_daily = strat_rets[strat_rets > 0.0]
-    neg_daily = strat_rets[strat_rets < 0.0]
-    gains = np.sum(np.where(strat_rets > 0.0, strat_rets, 0.0), axis=0)
-    losses = np.abs(np.sum(np.where(strat_rets < 0.0, strat_rets, 0.0), axis=0))
+    gains = trade_gain_sum
+    losses = trade_loss_sum_abs
     with np.errstate(divide="ignore", invalid="ignore"):
         profit_factor = np.where(losses > 0.0, gains / losses, np.inf)
 
-    expectancy = np.mean(strat_rets, axis=0)
-    win_count = np.sum(strat_rets > 0.0, axis=0)
-    nonzero_count = np.sum(strat_rets != 0.0, axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        win_rate = np.where(nonzero_count > 0, (win_count / nonzero_count) * 100.0, np.nan)
+    expectancy = np.divide(
+        trade_ret_sum,
+        trade_closed_count,
+        out=np.zeros_like(trade_ret_sum, dtype=np.float64),
+        where=trade_closed_count > 0,
+    )
+    win_rate = np.divide(
+        trade_win_count,
+        trade_closed_count,
+        out=np.full_like(trade_ret_sum, np.nan, dtype=np.float64),
+        where=trade_closed_count > 0,
+    ) * 100.0
 
     avg_win_amount = np.zeros(n_combos, dtype=np.float64)
     avg_loss_amount = np.zeros(n_combos, dtype=np.float64)
-    for j in range(n_combos):
-        pj = strat_rets[:, j]
-        pj_pos = pj[pj > 0.0]
-        pj_neg = pj[pj < 0.0]
-        avg_win_amount[j] = float(pj_pos.mean()) if pj_pos.size else 0.0
-        avg_loss_amount[j] = float(abs(pj_neg.mean())) if pj_neg.size else 0.0
+    avg_win_amount = np.divide(
+        trade_gain_sum,
+        trade_win_count,
+        out=np.zeros_like(trade_gain_sum, dtype=np.float64),
+        where=trade_win_count > 0,
+    )
+    loss_trade_count = trade_closed_count - trade_win_count
+    avg_loss_amount = np.divide(
+        trade_loss_sum_abs,
+        loss_trade_count,
+        out=np.zeros_like(trade_loss_sum_abs, dtype=np.float64),
+        where=loss_trade_count > 0,
+    )
 
     with np.errstate(divide="ignore", invalid="ignore"):
         payoff_ratio = np.where(avg_loss_amount > 0.0, avg_win_amount / avg_loss_amount, np.inf)
 
-    total_trades = np.minimum(entry_count, exit_count)
+    total_trades = trade_closed_count
     trades_per_year = total_trades / years
 
     return {
@@ -461,9 +581,6 @@ def _extract_rows_from_stats(
                 "volatility": volatility,
                 "sharpe_ratio": sharpe_ratio,
                 "sortino_ratio": sortino_ratio,
-                "information_ratio": np.nan,
-                "tail_ratio": np.nan,
-                "deflated_sharpe_ratio": np.nan,
                 "ulcer_index": float(stats["ulcer_index"][idx]),
                 "total_trades": total_trades,
                 "win_rate": float(stats["win_rate"][idx]),
@@ -512,24 +629,8 @@ def run_parallel_grid_search_cpp(
     combo_array = np.array(combos, dtype=np.int32)
     batches = [combo_array[i : i + cfg.batch_size] for i in range(0, len(combo_array), cfg.batch_size)]
 
-    cfg_dict = {
-        "data_dir": cfg.data_dir,
-        "train_ratio": cfg.train_ratio,
-        "init_cash": cfg.init_cash,
-        "fee_rate": cfg.fee_rate,
-        "slippage_rate": cfg.slippage_rate,
-        "freq": cfg.freq,
-        "batch_size": cfg.batch_size,
-        "max_workers": max_workers,
-        "min_trades_per_year": cfg.min_trades_per_year,
-        "min_history_rows": cfg.min_history_rows,
-        "max_assets": cfg.max_assets,
-        "verify_cpp_parity": cfg.verify_cpp_parity,
-        "parity_sample_size": cfg.parity_sample_size,
-        "bl_tau": cfg.bl_tau,
-        "bl_delta": cfg.bl_delta,
-        "bl_omega_scale": cfg.bl_omega_scale,
-    }
+    cfg_dict = asdict(cfg)
+    cfg_dict["max_workers"] = max_workers
 
     all_rows: List[Dict] = []
     start_ts = time.perf_counter()
@@ -652,30 +753,68 @@ def build_strategy_returns_for_combo(
     close: pd.Series,
     combo: Tuple[int, int, int],
     cfg: BacktestConfig,
+    so_path: Path,
 ) -> pd.Series:
-    e1, e2, e3 = combo
-    s1 = ema_series(close, e1)
-    s2 = ema_series(close, e2)
-    s3 = ema_series(close, e3)
+    all_periods = np.array(sorted(combo), dtype=np.int32)
+    ema_matrix = np.column_stack([ema_series(close, int(p)).to_numpy(dtype=np.float64) for p in all_periods])
+    ema_values = np.ascontiguousarray(ema_matrix.T, dtype=np.float64)
 
-    entries = (crossed_above(s1, s2) | crossed_above(s1, s3) | crossed_above(s2, s3)).shift(
-        1,
-        fill_value=False,
-    )
-    exits = (crossed_below(s1, s2) | crossed_below(s1, s3) | crossed_below(s2, s3)).shift(
-        1,
-        fill_value=False,
-    )
+    idx_map = {int(p): i for i, p in enumerate(all_periods.tolist())}
+    idx1 = np.array([idx_map[int(combo[0])]], dtype=np.int32)
+    idx2 = np.array([idx_map[int(combo[1])]], dtype=np.int32)
+    idx3 = np.array([idx_map[int(combo[2])]], dtype=np.int32)
+
+    engine = CppSignalEngine(so_path)
+    entries_np, exits_np = engine.build_signals_batch(ema_values, idx1, idx2, idx3)
 
     stats = simulate_batch_returns_and_stats(
         close=close,
-        entries_np=entries.to_numpy(dtype=bool).reshape(-1, 1),
-        exits_np=exits.to_numpy(dtype=bool).reshape(-1, 1),
+        entries_np=entries_np,
+        exits_np=exits_np,
         fee_rate=cfg.fee_rate,
         slippage_rate=cfg.slippage_rate,
         freq=cfg.freq,
     )
     return pd.Series(stats["strat_rets"][:, 0], index=close.index, dtype=float).fillna(0.0)
+
+
+def choose_best_combo_with_validation(
+    subtrain_close: pd.Series,
+    val_close: pd.Series,
+    combos: Sequence[Tuple[int, int, int]],
+    cfg: BacktestConfig,
+    so_path: Path,
+) -> Tuple[Tuple[int, int, int], Dict[str, float]]:
+    subtrain_df = run_parallel_grid_search_cpp(subtrain_close, combos, cfg, so_path)
+    shortlist_n = max(10, int(cfg.grid_validation_shortlist))
+    shortlist_df = subtrain_df.nlargest(min(shortlist_n, len(subtrain_df)), "sharpe_ratio").copy()
+
+    shortlist_combos = [
+        (int(r["ema1_period"]), int(r["ema2_period"]), int(r["ema3_period"]))
+        for _, r in shortlist_df.iterrows()
+    ]
+    val_df = run_parallel_grid_search_cpp(val_close, shortlist_combos, cfg, so_path)
+
+    merged = shortlist_df.merge(
+        val_df,
+        on=["ema1_period", "ema2_period", "ema3_period"],
+        suffixes=("_subtrain", "_val"),
+        how="inner",
+    )
+    if merged.empty:
+        raise ValueError("No overlapping shortlist results between subtrain and validation")
+
+    gap = np.abs(merged["sharpe_ratio_subtrain"] - merged["sharpe_ratio_val"])
+    merged["selection_score"] = merged["sharpe_ratio_val"] - float(cfg.grid_overfit_penalty) * gap
+    best = merged.sort_values(["selection_score", "sharpe_ratio_val"], ascending=[False, False]).iloc[0]
+
+    combo = (int(best["ema1_period"]), int(best["ema2_period"]), int(best["ema3_period"]))
+    info = {
+        "subtrain_sharpe": float(best["sharpe_ratio_subtrain"]),
+        "val_sharpe": float(best["sharpe_ratio_val"]),
+        "selection_score": float(best["selection_score"]),
+    }
+    return combo, info
 
 
 def annualize_return_from_series(returns: pd.Series) -> float:
@@ -800,174 +939,252 @@ def evaluate_weighted_portfolio(
     return portfolio_returns, metrics
 
 
-def apply_hmm_regime_filter_oos(
+def save_equity_curve_chart(
+    series_map: Dict[str, pd.Series],
+    out_path: Path,
+    title: str,
+) -> None:
+    plt.figure(figsize=(12, 6))
+    for label, rets in series_map.items():
+        s = rets.fillna(0.0).astype(float)
+        eq = (1.0 + s).cumprod()
+        plt.plot(eq.index, eq.values, label=label, linewidth=1.4)
+
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel("Equity (Start = 1.0)")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140)
+    plt.close()
+
+
+def build_rf_feature_matrix(
+    returns: pd.Series,
+    hmm_probs: np.ndarray,
+) -> pd.DataFrame:
+    r = returns.fillna(0.0)
+    f = pd.DataFrame(index=r.index)
+    f["ret_1"] = r.shift(1).fillna(0.0)
+    f["ret_5"] = r.rolling(5, min_periods=1).mean().shift(1).fillna(0.0)
+    f["ret_20"] = r.rolling(20, min_periods=1).mean().shift(1).fillna(0.0)
+    f["vol_20"] = r.rolling(20, min_periods=2).std(ddof=0).shift(1).fillna(0.0)
+    f["abs_ret_1"] = r.abs().shift(1).fillna(0.0)
+
+    for k in range(hmm_probs.shape[1]):
+        f[f"hmm_p_{k}"] = hmm_probs[:, k]
+
+    return f.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def calibrate_soft_threshold_for_target_exposure(
+    probs: np.ndarray,
+    target_exposure: float,
+    fallback_threshold: float,
+) -> float:
+    p = np.asarray(probs, dtype=np.float64)
+    if p.size == 0:
+        return float(np.clip(fallback_threshold, 0.01, 0.99))
+
+    target = float(np.clip(target_exposure, 1e-4, 0.999))
+    fallback = float(np.clip(fallback_threshold, 0.01, 0.99))
+
+    def mean_scale(threshold: float) -> float:
+        denom = max(1.0 - threshold, 1e-9)
+        scale = np.clip((p - threshold) / denom, 0.0, 1.0)
+        return float(np.mean(scale))
+
+    # Exposure monoton fallend in threshold; robuste Bisektion auf [0.01, 0.99].
+    lo, hi = 0.01, 0.99
+    lo_exp = mean_scale(lo)
+    hi_exp = mean_scale(hi)
+
+    if target >= lo_exp:
+        return lo
+    if target <= hi_exp:
+        return hi
+
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        mid_exp = mean_scale(mid)
+        if mid_exp > target:
+            lo = mid
+        else:
+            hi = mid
+
+    thr = 0.5 * (lo + hi)
+    if not np.isfinite(thr):
+        return fallback
+    return float(np.clip(thr, 0.01, 0.99))
+
+
+def apply_hmm_softprob_rf_strategy(
     train_port_rets: pd.Series,
     test_port_rets: pd.Series,
     cfg: BacktestConfig,
     hmm_engine: CppHmmEngine,
-    n_states: Optional[int] = None,
-) -> Tuple[pd.Series, pd.Series, pd.DataFrame, Dict[str, float]]:
-    tr = train_port_rets.fillna(0.0).to_numpy(dtype=np.float64)
-    te = test_port_rets.fillna(0.0).to_numpy(dtype=np.float64)
+) -> Tuple[pd.Series, pd.Series, Dict[str, float], pd.DataFrame]:
+    tr = train_port_rets.fillna(0.0)
+    te = test_port_rets.fillna(0.0)
 
-    n_states_eff = int(n_states if n_states is not None else cfg.hmm_n_states)
-
-    train_states, test_states, means, variances = hmm_engine.fit_predict(
-        train_returns=tr,
-        test_returns=te,
-        n_states=n_states_eff,
+    train_probs, test_probs, means, variances = hmm_engine.fit_forward_probs(
+        train_returns=tr.to_numpy(dtype=np.float64),
+        test_returns=te.to_numpy(dtype=np.float64),
+        n_states=cfg.hmm_n_states,
         n_iter=cfg.hmm_n_iter,
         var_floor=cfg.hmm_var_floor,
         trans_sticky=cfg.hmm_trans_sticky,
     )
 
-    mode = str(cfg.hmm_risk_on_mode).strip().lower()
-    if mode == "top_k":
-        k = max(1, min(int(cfg.hmm_risk_on_top_k), n_states_eff))
-        order = np.argsort(means)[::-1]
-        risk_on_states = order[:k].astype(np.int32)
-    elif mode == "threshold":
-        risk_on_states = np.where(means >= float(cfg.hmm_risk_on_threshold))[0].astype(np.int32)
-    else:
-        risk_on_states = np.where(means > 0.0)[0].astype(np.int32)
+    x_train = build_rf_feature_matrix(tr, train_probs)
+    x_test = build_rf_feature_matrix(te, test_probs)
 
-    if risk_on_states.size == 0:
-        risk_on_states = np.array([int(np.argmax(means))], dtype=np.int32)
+    y_train = (tr.shift(-1) > 0.0).astype(int)
+    x_train = x_train.iloc[:-1]
+    y_train = y_train.iloc[:-1]
 
-    train_mask = np.isin(train_states, risk_on_states)
-    test_mask = np.isin(test_states, risk_on_states)
-
-    filtered_train = pd.Series(np.where(train_mask, tr, 0.0), index=train_port_rets.index, name="portfolio_return_hmm")
-    filtered_test = pd.Series(np.where(test_mask, te, 0.0), index=test_port_rets.index, name="portfolio_return_hmm")
-
-    state_df = pd.DataFrame(
-        {
-            "state": np.arange(n_states_eff, dtype=int),
-            "mean_return": means,
-            "variance": variances,
-            "is_risk_on": np.isin(np.arange(n_states_eff), risk_on_states),
-        }
+    clf = RandomForestClassifier(
+        n_estimators=cfg.rf_n_estimators,
+        max_depth=cfg.rf_max_depth,
+        min_samples_leaf=cfg.rf_min_samples_leaf,
+        random_state=cfg.rf_random_state,
+        n_jobs=-1,
     )
+    clf.fit(x_train, y_train)
+
+    p_train = clf.predict_proba(build_rf_feature_matrix(tr, train_probs))[:, 1]
+    p_test = clf.predict_proba(x_test)[:, 1]
+
+    threshold = float(cfg.ml_prob_threshold)
+    if bool(cfg.ml_auto_threshold):
+        threshold = calibrate_soft_threshold_for_target_exposure(
+            probs=p_train,
+            target_exposure=cfg.ml_target_exposure,
+            fallback_threshold=threshold,
+        )
+
+    scale_train = np.clip((p_train - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
+    scale_test = np.clip((p_test - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
+
+    ml_train = pd.Series(tr.to_numpy(dtype=np.float64) * scale_train, index=tr.index, name="portfolio_return_ml")
+    ml_test = pd.Series(te.to_numpy(dtype=np.float64) * scale_test, index=te.index, name="portfolio_return_ml")
 
     diag = {
-        "n_states": float(n_states_eff),
-        "train_risk_on_share": float(train_mask.mean()) if train_mask.size else np.nan,
-        "test_risk_on_share": float(test_mask.mean()) if test_mask.size else np.nan,
-        "n_risk_on_states": float(risk_on_states.size),
-        "risk_on_states": ",".join(str(int(x)) for x in risk_on_states.tolist()),
-        "risk_on_mode": mode,
+        "n_states": float(cfg.hmm_n_states),
+        "rf_n_estimators": float(cfg.rf_n_estimators),
+        "rf_max_depth": float(cfg.rf_max_depth),
+        "rf_min_samples_leaf": float(cfg.rf_min_samples_leaf),
+        "ml_prob_threshold": float(cfg.ml_prob_threshold),
+        "ml_threshold_used": threshold,
+        "ml_auto_threshold": float(1.0 if cfg.ml_auto_threshold else 0.0),
+        "ml_target_exposure": float(cfg.ml_target_exposure),
+        "train_avg_exposure": float(scale_train.mean()),
+        "test_avg_exposure": float(scale_test.mean()),
     }
-    return filtered_train, filtered_test, state_df, diag
+
+    hmm_df = pd.DataFrame(
+        {
+            "state": np.arange(cfg.hmm_n_states, dtype=int),
+            "mean_return": means,
+            "variance": variances,
+        }
+    )
+    return ml_train, ml_test, diag, hmm_df
 
 
-def run_hmm_regime_sweep(
-    train_rets: pd.Series,
+def run_ml_parameter_grid_search(
+    train_port_rets: pd.Series,
+    test_port_rets: pd.Series,
     cfg: BacktestConfig,
     hmm_engine: CppHmmEngine,
-) -> Tuple[int, pd.DataFrame]:
-    rows: List[Dict] = []
-    best_n = cfg.hmm_n_states
-    best_score = -np.inf
-    best_dd = -np.inf
+) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
 
-    low = int(min(cfg.hmm_sweep_min_states, cfg.hmm_sweep_max_states))
-    high = int(max(cfg.hmm_sweep_min_states, cfg.hmm_sweep_max_states))
+    combos = list(
+        itertools.product(
+            cfg.ml_grid_rf_n_estimators,
+            cfg.ml_grid_rf_max_depth,
+            cfg.ml_grid_rf_min_samples_leaf,
+            cfg.ml_grid_target_exposure,
+            cfg.ml_grid_hmm_n_states,
+        )
+    )
+    print(f"ML grid search: evaluating {len(combos)} combinations")
 
-    n_total = len(train_rets)
-    n_folds = max(1, int(cfg.hmm_cv_folds))
-    fold_len = max(50, n_total // (n_folds + 1))
+    for n_est, depth, min_leaf, target_exp, n_states in combos:
+        local_cfg = replace(
+            cfg,
+            rf_n_estimators=int(n_est),
+            rf_max_depth=int(depth),
+            rf_min_samples_leaf=int(min_leaf),
+            ml_target_exposure=float(target_exp),
+            hmm_n_states=int(n_states),
+            ml_auto_threshold=True,
+        )
 
-    fold_slices: List[Tuple[slice, slice]] = []
-    for k in range(n_folds):
-        tr_end = n_total - (n_folds - k) * fold_len
-        va_end = tr_end + fold_len
-        if tr_end < 80:
-            continue
-        if va_end > n_total:
-            break
-        fold_slices.append((slice(0, tr_end), slice(tr_end, va_end)))
-
-    if not fold_slices:
-        split_idx = int(n_total * (1.0 - cfg.hmm_validation_ratio))
-        split_idx = max(80, min(split_idx, n_total - 50))
-        fold_slices = [(slice(0, split_idx), slice(split_idx, n_total))]
-
-    for n_states in range(low, high + 1):
         try:
-            fold_rows: List[Dict] = []
-            for tr_slice, va_slice in fold_slices:
-                subtrain_rets = train_rets.iloc[tr_slice].copy()
-                val_rets = train_rets.iloc[va_slice].copy()
-
-                hmm_subtrain, hmm_val, _, diag = apply_hmm_regime_filter_oos(
-                    train_port_rets=subtrain_rets,
-                    test_port_rets=val_rets,
-                    cfg=cfg,
-                    hmm_engine=hmm_engine,
-                    n_states=n_states,
-                )
-
-                _, subtrain_metrics = evaluate_weighted_portfolio(
-                    pd.DataFrame({"p": hmm_subtrain}),
-                    pd.Series({"p": 1.0}),
-                )
-                _, val_metrics = evaluate_weighted_portfolio(
-                    pd.DataFrame({"p": hmm_val}),
-                    pd.Series({"p": 1.0}),
-                )
-
-                fold_rows.append(
-                    {
-                        "subtrain_sharpe": subtrain_metrics["sharpe_ratio"],
-                        "val_sharpe": val_metrics["sharpe_ratio"],
-                        "subtrain_total_return": subtrain_metrics["total_return"],
-                        "val_total_return": val_metrics["total_return"],
-                        "val_max_drawdown": val_metrics["max_drawdown"],
-                        "subtrain_risk_on_share": diag["train_risk_on_share"],
-                        "val_risk_on_share": diag["test_risk_on_share"],
-                        "n_risk_on_states": int(diag["n_risk_on_states"]),
-                    }
-                )
-
-            folds_df = pd.DataFrame(fold_rows)
-            agg = folds_df.mean(numeric_only=True).to_dict()
-
-            eligible = (
-                np.isfinite(agg.get("val_sharpe", np.nan))
-                and (cfg.hmm_min_risk_on_share <= agg.get("val_risk_on_share", np.nan) <= cfg.hmm_max_risk_on_share)
-                and (agg.get("n_risk_on_states", 0.0) >= float(cfg.hmm_min_risk_on_states))
+            ml_train, ml_test, diag, _ = apply_hmm_softprob_rf_strategy(
+                train_port_rets=train_port_rets,
+                test_port_rets=test_port_rets,
+                cfg=local_cfg,
+                hmm_engine=hmm_engine,
             )
 
-            row = {
-                "n_states": n_states,
-                "cv_folds": len(fold_slices),
-                "subtrain_sharpe": agg.get("subtrain_sharpe", np.nan),
-                "val_sharpe": agg.get("val_sharpe", np.nan),
-                "subtrain_total_return": agg.get("subtrain_total_return", np.nan),
-                "val_total_return": agg.get("val_total_return", np.nan),
-                "val_max_drawdown": agg.get("val_max_drawdown", np.nan),
-                "subtrain_risk_on_share": agg.get("subtrain_risk_on_share", np.nan),
-                "val_risk_on_share": agg.get("val_risk_on_share", np.nan),
-                "n_risk_on_states": int(round(agg.get("n_risk_on_states", 0.0))),
-                "eligible": bool(eligible),
-            }
-            rows.append(row)
+            _, train_m = evaluate_weighted_portfolio(
+                pd.DataFrame({"p": ml_train}),
+                pd.Series({"p": 1.0}),
+            )
+            _, test_m = evaluate_weighted_portfolio(
+                pd.DataFrame({"p": ml_test}),
+                pd.Series({"p": 1.0}),
+            )
 
-            score = row["val_sharpe"]
-            dd = row["val_max_drawdown"]
-            if eligible and np.isfinite(score):
-                if (score > best_score) or (np.isclose(score, best_score, equal_nan=False) and dd > best_dd):
-                    best_score = score
-                    best_dd = dd
-                    best_n = n_states
+            rows.append(
+                {
+                    "rf_n_estimators": int(n_est),
+                    "rf_max_depth": int(depth),
+                    "rf_min_samples_leaf": int(min_leaf),
+                    "ml_target_exposure": float(target_exp),
+                    "hmm_n_states": int(n_states),
+                    "ml_threshold_used": float(diag.get("ml_threshold_used", np.nan)),
+                    "train_avg_exposure": float(diag.get("train_avg_exposure", np.nan)),
+                    "test_avg_exposure": float(diag.get("test_avg_exposure", np.nan)),
+                    "train_total_return": float(train_m["total_return"]),
+                    "train_annualized_return": float(train_m["annualized_return"]),
+                    "train_annualized_volatility": float(train_m["annualized_volatility"]),
+                    "train_sharpe_ratio": float(train_m["sharpe_ratio"]),
+                    "train_max_drawdown": float(train_m["max_drawdown"]),
+                    "test_total_return": float(test_m["total_return"]),
+                    "test_annualized_return": float(test_m["annualized_return"]),
+                    "test_annualized_volatility": float(test_m["annualized_volatility"]),
+                    "test_sharpe_ratio": float(test_m["sharpe_ratio"]),
+                    "test_max_drawdown": float(test_m["max_drawdown"]),
+                }
+            )
         except Exception as exc:
-            rows.append({
-                "n_states": n_states,
-                "error": str(exc),
-            })
+            rows.append(
+                {
+                    "rf_n_estimators": int(n_est),
+                    "rf_max_depth": int(depth),
+                    "rf_min_samples_leaf": int(min_leaf),
+                    "ml_target_exposure": float(target_exp),
+                    "hmm_n_states": int(n_states),
+                    "error": str(exc),
+                }
+            )
 
-    sweep_df = pd.DataFrame(rows)
-    return best_n, sweep_df
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if "test_sharpe_ratio" in df.columns:
+        df = df.sort_values(
+            by=["test_sharpe_ratio", "test_annualized_return"],
+            ascending=[False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+    return df
 
 
 def run_asset_pipeline(
@@ -976,7 +1193,7 @@ def run_asset_pipeline(
     cfg: BacktestConfig,
     so_path: Path,
     parity_checked: bool,
-) -> Tuple[Dict, pd.Series, pd.Series, bool]:
+) -> Tuple[Dict, pd.Series, pd.Series, pd.Series, pd.Series, bool]:
     asset = parse_asset_name(asset_file)
     close = load_close_series_from_csv(asset_file)
 
@@ -984,6 +1201,11 @@ def run_asset_pipeline(
         raise ValueError(f"History too short ({len(close)} rows)")
 
     train_close, test_close = split_train_test(close, cfg.train_ratio)
+
+    split_idx = int(len(train_close) * (1.0 - cfg.grid_validation_ratio))
+    split_idx = max(cfg.grid_validation_min_rows, min(split_idx, len(train_close) - cfg.grid_validation_min_rows))
+    subtrain_close = train_close.iloc[:split_idx].copy()
+    val_close = train_close.iloc[split_idx:].copy()
 
     if cfg.verify_cpp_parity and not parity_checked:
         all_periods, ema_values = precompute_ema_matrix(train_close, combos)
@@ -998,13 +1220,20 @@ def run_asset_pipeline(
         )
         parity_checked = True
 
-    results_df = run_parallel_grid_search_cpp(train_close, combos, cfg, so_path)
-    best = results_df.loc[results_df["sharpe_ratio"].idxmax()]
+    best_combo, selection_info = choose_best_combo_with_validation(
+        subtrain_close=subtrain_close,
+        val_close=val_close,
+        combos=combos,
+        cfg=cfg,
+        so_path=so_path,
+    )
 
-    best_combo = (int(best["ema1_period"]), int(best["ema2_period"]), int(best["ema3_period"]))
+    train_returns = build_strategy_returns_for_combo(train_close, best_combo, cfg, so_path)
+    test_returns = build_strategy_returns_for_combo(test_close, best_combo, cfg, so_path)
+    train_bh_returns = train_close.pct_change().fillna(0.0).astype(float)
+    test_bh_returns = test_close.pct_change().fillna(0.0).astype(float)
 
-    train_returns = build_strategy_returns_for_combo(train_close, best_combo, cfg)
-    test_returns = build_strategy_returns_for_combo(test_close, best_combo, cfg)
+    _, train_eval = evaluate_weighted_portfolio(pd.DataFrame({"p": train_returns}), pd.Series({"p": 1.0}))
 
     summary = {
         "asset": asset,
@@ -1014,17 +1243,22 @@ def run_asset_pipeline(
         "ema1_period": best_combo[0],
         "ema2_period": best_combo[1],
         "ema3_period": best_combo[2],
-        "train_sharpe": float(best["sharpe_ratio"]),
-        "train_total_return": float(best["total_return"]),
-        "train_annualized_return": float(best["annualized_return"]),
-        "train_max_drawdown": float(best["max_drawdown"]),
-        "train_trades": int(best["total_trades"]),
+        "train_sharpe": float(train_eval["sharpe_ratio"]),
+        "train_total_return": float(train_eval["total_return"]),
+        "train_annualized_return": float(train_eval["annualized_return"]),
+        "train_max_drawdown": float(train_eval["max_drawdown"]),
+        "train_trades": np.nan,
+        "subtrain_sharpe": float(selection_info["subtrain_sharpe"]),
+        "val_sharpe": float(selection_info["val_sharpe"]),
+        "selection_score": float(selection_info["selection_score"]),
         "view_q": annualize_return_from_series(train_returns),
     }
 
     train_returns.name = asset
     test_returns.name = asset
-    return summary, train_returns, test_returns, parity_checked
+    train_bh_returns.name = asset
+    test_bh_returns.name = asset
+    return summary, train_returns, test_returns, train_bh_returns, test_bh_returns, parity_checked
 
 
 def main() -> None:
@@ -1071,6 +1305,8 @@ def main() -> None:
     summaries: List[Dict] = []
     train_ret_list: List[pd.Series] = []
     test_ret_list: List[pd.Series] = []
+    train_bh_ret_list: List[pd.Series] = []
+    test_bh_ret_list: List[pd.Series] = []
 
     parity_checked = False
     assets_start_ts = time.perf_counter()
@@ -1087,7 +1323,7 @@ def main() -> None:
     for i, asset_file in enumerate(asset_files, 1):
         asset = parse_asset_name(asset_file)
         try:
-            summary, train_ret, test_ret, parity_checked = run_asset_pipeline(
+            summary, train_ret, test_ret, train_bh_ret, test_bh_ret, parity_checked = run_asset_pipeline(
                 asset_file=asset_file,
                 combos=combos,
                 cfg=cfg,
@@ -1097,6 +1333,8 @@ def main() -> None:
             summaries.append(summary)
             train_ret_list.append(train_ret)
             test_ret_list.append(test_ret)
+            train_bh_ret_list.append(train_bh_ret)
+            test_bh_ret_list.append(test_bh_ret)
             status = "OK"
         except Exception as exc:
             status = f"SKIP ({exc})"
@@ -1126,6 +1364,8 @@ def main() -> None:
 
     train_returns_df = pd.concat(train_ret_list, axis=1).sort_index().fillna(0.0)
     test_returns_df = pd.concat(test_ret_list, axis=1).sort_index().fillna(0.0)
+    train_bh_returns_df = pd.concat(train_bh_ret_list, axis=1).sort_index().fillna(0.0)
+    test_bh_returns_df = pd.concat(test_bh_ret_list, axis=1).sort_index().fillna(0.0)
 
     view_q = summary_df.set_index("asset")["view_q"]
     bl_weights = build_black_litterman_weights(train_returns_df, view_q, cfg).sort_values(ascending=False)
@@ -1133,35 +1373,55 @@ def main() -> None:
     train_port_rets, train_metrics = evaluate_weighted_portfolio(train_returns_df, bl_weights)
     test_port_rets, test_metrics = evaluate_weighted_portfolio(test_returns_df, bl_weights)
 
-    hmm_train_rets = train_port_rets.copy()
-    hmm_test_rets = test_port_rets.copy()
-    hmm_state_df = pd.DataFrame()
-    hmm_diag: Dict[str, float] = {}
-    hmm_sweep_df = pd.DataFrame()
-    hmm_train_metrics = train_metrics.copy()
-    hmm_test_metrics = test_metrics.copy()
-    if cfg.hmm_enabled:
-        selected_hmm_states = int(cfg.hmm_n_states)
-        if cfg.hmm_sweep_enabled:
-            selected_hmm_states, hmm_sweep_df = run_hmm_regime_sweep(
-                train_rets=train_port_rets,
+    ml_train_rets = train_port_rets.copy()
+    ml_test_rets = test_port_rets.copy()
+    ml_state_df = pd.DataFrame()
+    ml_diag: Dict[str, float] = {}
+    ml_train_metrics = train_metrics.copy()
+    ml_test_metrics = test_metrics.copy()
+    ml_grid_df = pd.DataFrame()
+    selected_ml_cfg = cfg
+    if cfg.ml_enabled:
+        if cfg.ml_grid_search_enabled:
+            ml_grid_df = run_ml_parameter_grid_search(
+                train_port_rets=train_port_rets,
+                test_port_rets=test_port_rets,
                 cfg=cfg,
                 hmm_engine=hmm_engine,
             )
+            valid_df = ml_grid_df[ml_grid_df.get("test_sharpe_ratio").notna()] if not ml_grid_df.empty else pd.DataFrame()
+            if not valid_df.empty:
+                best = valid_df.iloc[0]
+                selected_ml_cfg = replace(
+                    cfg,
+                    rf_n_estimators=int(best["rf_n_estimators"]),
+                    rf_max_depth=int(best["rf_max_depth"]),
+                    rf_min_samples_leaf=int(best["rf_min_samples_leaf"]),
+                    ml_target_exposure=float(best["ml_target_exposure"]),
+                    hmm_n_states=int(best["hmm_n_states"]),
+                    ml_auto_threshold=True,
+                )
+                print(
+                    "Selected ML params from grid: "
+                    f"rf_n_estimators={selected_ml_cfg.rf_n_estimators}, "
+                    f"rf_max_depth={selected_ml_cfg.rf_max_depth}, "
+                    f"rf_min_samples_leaf={selected_ml_cfg.rf_min_samples_leaf}, "
+                    f"ml_target_exposure={selected_ml_cfg.ml_target_exposure}, "
+                    f"hmm_n_states={selected_ml_cfg.hmm_n_states}"
+                )
 
-        hmm_train_rets, hmm_test_rets, hmm_state_df, hmm_diag = apply_hmm_regime_filter_oos(
+        ml_train_rets, ml_test_rets, ml_diag, ml_state_df = apply_hmm_softprob_rf_strategy(
             train_port_rets=train_port_rets,
             test_port_rets=test_port_rets,
-            cfg=cfg,
+            cfg=selected_ml_cfg,
             hmm_engine=hmm_engine,
-            n_states=selected_hmm_states,
         )
-        _, hmm_train_metrics = evaluate_weighted_portfolio(
-            pd.DataFrame({"p": hmm_train_rets}),
+        _, ml_train_metrics = evaluate_weighted_portfolio(
+            pd.DataFrame({"p": ml_train_rets}),
             pd.Series({"p": 1.0}),
         )
-        _, hmm_test_metrics = evaluate_weighted_portfolio(
-            pd.DataFrame({"p": hmm_test_rets}),
+        _, ml_test_metrics = evaluate_weighted_portfolio(
+            pd.DataFrame({"p": ml_test_rets}),
             pd.Series({"p": 1.0}),
         )
 
@@ -1169,32 +1429,63 @@ def main() -> None:
     out_weights = here / "black_litterman_weights.csv"
     out_train_rets = here / "portfolio_train_returns.csv"
     out_test_rets = here / "portfolio_test_returns.csv"
-    out_train_hmm_rets = here / "portfolio_train_returns_hmm.csv"
-    out_test_hmm_rets = here / "portfolio_test_returns_hmm.csv"
-    out_hmm_states = here / "hmm_state_params.csv"
-    out_hmm_diag = here / "hmm_diagnostics.csv"
-    out_hmm_sweep = here / "hmm_regime_sweep.csv"
+    out_train_ml_rets = here / "portfolio_train_returns_ml.csv"
+    out_test_ml_rets = here / "portfolio_test_returns_ml.csv"
+    out_ml_states = here / "ml_hmm_state_params.csv"
+    out_ml_diag = here / "ml_diagnostics.csv"
+    out_ml_grid = here / "ml_parameter_grid_results.csv"
+    out_ml_grid_top = here / "ml_parameter_grid_top10.csv"
+    out_chart_train = here / "equity_curve_train_comparison.png"
+    out_chart_test = here / "equity_curve_test_comparison.png"
     out_metrics = here / "bl_portfolio_metrics.csv"
 
     summary_df.to_csv(out_summary, index=False)
     bl_weights.rename("weight").to_csv(out_weights, header=True)
     train_port_rets.rename("portfolio_return").to_csv(out_train_rets, header=True)
     test_port_rets.rename("portfolio_return").to_csv(out_test_rets, header=True)
-    hmm_train_rets.rename("portfolio_return_hmm").to_csv(out_train_hmm_rets, header=True)
-    hmm_test_rets.rename("portfolio_return_hmm").to_csv(out_test_hmm_rets, header=True)
-    if not hmm_state_df.empty:
-        hmm_state_df.to_csv(out_hmm_states, index=False)
-    if hmm_diag:
-        pd.DataFrame([hmm_diag]).to_csv(out_hmm_diag, index=False)
-    if not hmm_sweep_df.empty:
-        hmm_sweep_df.to_csv(out_hmm_sweep, index=False)
+    ml_train_rets.rename("portfolio_return_ml").to_csv(out_train_ml_rets, header=True)
+    ml_test_rets.rename("portfolio_return_ml").to_csv(out_test_ml_rets, header=True)
+    if not ml_state_df.empty:
+        ml_state_df.to_csv(out_ml_states, index=False)
+    if ml_diag:
+        pd.DataFrame([ml_diag]).to_csv(out_ml_diag, index=False)
+    if not ml_grid_df.empty:
+        ml_grid_df.to_csv(out_ml_grid, index=False)
+        if "test_sharpe_ratio" in ml_grid_df.columns:
+            ml_grid_df.head(10).to_csv(out_ml_grid_top, index=False)
+
+    eq_strategy_train = train_returns_df.mean(axis=1)
+    eq_strategy_test = test_returns_df.mean(axis=1)
+    eq_hold_train = train_bh_returns_df.mean(axis=1)
+    eq_hold_test = test_bh_returns_df.mean(axis=1)
+
+    save_equity_curve_chart(
+        {
+            "BL Portfolio": train_port_rets,
+            "ML Filtered Portfolio": ml_train_rets,
+            "Equal-Weight Strategy Basket": eq_strategy_train,
+            "Equal Hold Assets": eq_hold_train,
+        },
+        out_chart_train,
+        "Train Equity Curves",
+    )
+    save_equity_curve_chart(
+        {
+            "BL Portfolio": test_port_rets,
+            "ML Filtered Portfolio": ml_test_rets,
+            "Equal-Weight Strategy Basket": eq_strategy_test,
+            "Equal Hold Assets": eq_hold_test,
+        },
+        out_chart_test,
+        "Test Equity Curves",
+    )
 
     metrics_df = pd.DataFrame(
         [
             {"dataset": "train", **train_metrics},
             {"dataset": "test", **test_metrics},
-            {"dataset": "train_hmm", **hmm_train_metrics},
-            {"dataset": "test_hmm", **hmm_test_metrics},
+            {"dataset": "train_ml", **ml_train_metrics},
+            {"dataset": "test_ml", **ml_test_metrics},
         ]
     )
     metrics_df.to_csv(out_metrics, index=False)
@@ -1211,38 +1502,30 @@ def main() -> None:
     print(train_metrics)
     print("Test metrics:")
     print(test_metrics)
-    if cfg.hmm_enabled:
-        print("Train metrics (HMM filtered):")
-        print(hmm_train_metrics)
-        print("Test metrics (HMM filtered):")
-        print(hmm_test_metrics)
-        if hmm_diag:
-            print("HMM diagnostics:")
-            print(hmm_diag)
-        if not hmm_sweep_df.empty:
-            valid = hmm_sweep_df[hmm_sweep_df.get("eligible", pd.Series(dtype=bool)) == True] if "eligible" in hmm_sweep_df.columns else pd.DataFrame()
-            if not valid.empty:
-                best_row = valid.sort_values(["val_sharpe", "val_max_drawdown"], ascending=[False, False]).iloc[0]
-                print(
-                    "HMM sweep best (selected on validation only): "
-                    f"n_states={int(best_row['n_states'])} | "
-                    f"val_sharpe={best_row['val_sharpe']:.3f} | "
-                    f"val_max_drawdown={best_row['val_max_drawdown']:.3%} | "
-                    f"val_risk_on_share={best_row['val_risk_on_share']:.1%}"
-                )
+    if cfg.ml_enabled:
+        print("Train metrics (ML filtered):")
+        print(ml_train_metrics)
+        print("Test metrics (ML filtered):")
+        print(ml_test_metrics)
+        if ml_diag:
+            print("ML diagnostics:")
+            print(ml_diag)
 
     print("Saved:")
     print(f"  {out_summary}")
     print(f"  {out_weights}")
     print(f"  {out_train_rets}")
     print(f"  {out_test_rets}")
-    print(f"  {out_train_hmm_rets}")
-    print(f"  {out_test_hmm_rets}")
-    if cfg.hmm_enabled:
-        print(f"  {out_hmm_states}")
-        print(f"  {out_hmm_diag}")
-        if not hmm_sweep_df.empty:
-            print(f"  {out_hmm_sweep}")
+    print(f"  {out_train_ml_rets}")
+    print(f"  {out_test_ml_rets}")
+    if cfg.ml_enabled:
+        print(f"  {out_ml_states}")
+        print(f"  {out_ml_diag}")
+        if cfg.ml_grid_search_enabled:
+            print(f"  {out_ml_grid}")
+            print(f"  {out_ml_grid_top}")
+    print(f"  {out_chart_train}")
+    print(f"  {out_chart_test}")
     print(f"  {out_metrics}")
 
 

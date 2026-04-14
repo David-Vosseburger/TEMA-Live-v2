@@ -112,6 +112,13 @@ void fit_hmm_em(
     std::vector<double>& vars
 ) {
     const int T_train = static_cast<int>(train_obs.size());
+    if (T_train <= 2 || n_states <= 1) {
+        pi.assign(static_cast<size_t>(std::max(n_states, 1)), 1.0);
+        trans.assign(static_cast<size_t>(std::max(n_states * n_states, 1)), 1.0);
+        means.assign(static_cast<size_t>(std::max(n_states, 1)), 0.0);
+        vars.assign(static_cast<size_t>(std::max(n_states, 1)), std::max(var_floor, 1e-12));
+        return;
+    }
 
     pi.assign(static_cast<size_t>(n_states), 1.0 / static_cast<double>(n_states));
     trans.assign(static_cast<size_t>(n_states * n_states), 0.0);
@@ -317,6 +324,119 @@ void forward_filter_decode(
     }
 }
 
+void forward_filter_decode_with_init(
+    const std::vector<double>& obs,
+    int n_states,
+    const std::vector<double>& init_probs,
+    const std::vector<double>& trans,
+    const std::vector<double>& means,
+    const std::vector<double>& vars,
+    std::vector<int32_t>& states_out
+) {
+    const int T = static_cast<int>(obs.size());
+    states_out.assign(T, 0);
+    if (T <= 0 || n_states <= 0) {
+        return;
+    }
+
+    std::vector<double> alpha(static_cast<size_t>(n_states), 0.0);
+    std::vector<double> alpha_next(static_cast<size_t>(n_states), 0.0);
+
+    for (int i = 0; i < n_states; ++i) {
+        alpha[i] = init_probs[i] * std::exp(gaussian_logpdf(obs[0], means[i], vars[i]));
+    }
+    normalize_row(alpha);
+    states_out[0] = static_cast<int32_t>(std::distance(alpha.begin(), std::max_element(alpha.begin(), alpha.end())));
+
+    for (int t = 1; t < T; ++t) {
+        for (int j = 0; j < n_states; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < n_states; ++i) {
+                s += alpha[i] * trans[i * n_states + j];
+            }
+            alpha_next[j] = s * std::exp(gaussian_logpdf(obs[t], means[j], vars[j]));
+        }
+        normalize_row(alpha_next);
+        states_out[t] = static_cast<int32_t>(std::distance(alpha_next.begin(), std::max_element(alpha_next.begin(), alpha_next.end())));
+        alpha.swap(alpha_next);
+    }
+}
+
+void forward_filter_probs(
+    const std::vector<double>& obs,
+    int n_states,
+    const std::vector<double>& init_probs,
+    const std::vector<double>& trans,
+    const std::vector<double>& means,
+    const std::vector<double>& vars,
+    std::vector<double>& probs_out
+) {
+    const int T = static_cast<int>(obs.size());
+    probs_out.assign(static_cast<size_t>(std::max(T * n_states, 0)), 0.0);
+    if (T <= 0 || n_states <= 0) {
+        return;
+    }
+
+    std::vector<double> alpha(static_cast<size_t>(n_states), 0.0);
+    std::vector<double> alpha_next(static_cast<size_t>(n_states), 0.0);
+
+    for (int i = 0; i < n_states; ++i) {
+        alpha[i] = init_probs[i] * std::exp(gaussian_logpdf(obs[0], means[i], vars[i]));
+    }
+    normalize_row(alpha);
+    for (int i = 0; i < n_states; ++i) {
+        probs_out[i] = alpha[i];
+    }
+
+    for (int t = 1; t < T; ++t) {
+        for (int j = 0; j < n_states; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < n_states; ++i) {
+                s += alpha[i] * trans[i * n_states + j];
+            }
+            alpha_next[j] = s * std::exp(gaussian_logpdf(obs[t], means[j], vars[j]));
+        }
+        normalize_row(alpha_next);
+        for (int i = 0; i < n_states; ++i) {
+            probs_out[t * n_states + i] = alpha_next[i];
+        }
+        alpha.swap(alpha_next);
+    }
+}
+
+std::vector<double> forward_last_posterior(
+    const std::vector<double>& obs,
+    int n_states,
+    const std::vector<double>& pi,
+    const std::vector<double>& trans,
+    const std::vector<double>& means,
+    const std::vector<double>& vars
+) {
+    std::vector<double> alpha(static_cast<size_t>(n_states), 0.0);
+    std::vector<double> alpha_next(static_cast<size_t>(n_states), 0.0);
+    if (obs.empty() || n_states <= 0) {
+        return alpha;
+    }
+
+    for (int i = 0; i < n_states; ++i) {
+        alpha[i] = pi[i] * std::exp(gaussian_logpdf(obs[0], means[i], vars[i]));
+    }
+    normalize_row(alpha);
+
+    for (size_t t = 1; t < obs.size(); ++t) {
+        for (int j = 0; j < n_states; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < n_states; ++i) {
+                s += alpha[i] * trans[i * n_states + j];
+            }
+            alpha_next[j] = s * std::exp(gaussian_logpdf(obs[t], means[j], vars[j]));
+        }
+        normalize_row(alpha_next);
+        alpha.swap(alpha_next);
+    }
+    return alpha;
+}
+
 }  // namespace
 
 extern "C" int fit_predict_hmm_1d(
@@ -357,14 +477,77 @@ extern "C" int fit_predict_hmm_1d(
 
     std::vector<int32_t> train_states;
     std::vector<int32_t> test_states;
-    forward_filter_decode(train_vec, n_states, pi, trans, means, vars, train_states);
-    forward_filter_decode(test_vec, n_states, pi, trans, means, vars, test_states);
+    viterbi_decode(train_vec, n_states, pi, trans, means, vars, train_states);
+
+    std::vector<double> init_test = forward_last_posterior(train_vec, n_states, pi, trans, means, vars);
+    forward_filter_decode_with_init(test_vec, n_states, init_test, trans, means, vars, test_states);
 
     for (int t = 0; t < n_train; ++t) {
         train_states_out[t] = train_states[t];
     }
     for (int t = 0; t < n_test; ++t) {
         test_states_out[t] = test_states[t];
+    }
+    for (int i = 0; i < n_states; ++i) {
+        state_means_out[i] = means[i];
+        state_vars_out[i] = vars[i];
+    }
+
+    return 0;
+}
+
+extern "C" int fit_hmm_forward_probs_1d(
+    const double* train_obs,
+    int n_train,
+    const double* test_obs,
+    int n_test,
+    int n_states,
+    int n_iter,
+    double var_floor,
+    double trans_sticky,
+    double* train_probs_out,
+    double* test_probs_out,
+    double* state_means_out,
+    double* state_vars_out
+) {
+    if (!train_obs || !test_obs || !train_probs_out || !test_probs_out || !state_means_out || !state_vars_out) {
+        return 1;
+    }
+    if (n_train <= 2 || n_states <= 1 || n_test <= 0) {
+        return 2;
+    }
+
+    std::vector<double> train_vec(static_cast<size_t>(n_train));
+    std::vector<double> test_vec(static_cast<size_t>(n_test));
+    for (int t = 0; t < n_train; ++t) {
+        train_vec[t] = train_obs[t];
+    }
+    for (int t = 0; t < n_test; ++t) {
+        test_vec[t] = test_obs[t];
+    }
+
+    std::vector<double> pi;
+    std::vector<double> trans;
+    std::vector<double> means;
+    std::vector<double> vars;
+    fit_hmm_em(train_vec, n_states, n_iter, var_floor, trans_sticky, pi, trans, means, vars);
+
+    std::vector<double> train_probs;
+    std::vector<double> test_probs;
+    forward_filter_probs(train_vec, n_states, pi, trans, means, vars, train_probs);
+
+    std::vector<double> init_test = forward_last_posterior(train_vec, n_states, pi, trans, means, vars);
+    forward_filter_probs(test_vec, n_states, init_test, trans, means, vars, test_probs);
+
+    for (int t = 0; t < n_train; ++t) {
+        for (int s = 0; s < n_states; ++s) {
+            train_probs_out[t * n_states + s] = train_probs[t * n_states + s];
+        }
+    }
+    for (int t = 0; t < n_test; ++t) {
+        for (int s = 0; s < n_states; ++s) {
+            test_probs_out[t * n_states + s] = test_probs[t * n_states + s];
+        }
     }
     for (int i = 0; i < n_states; ++i) {
         state_means_out[i] = means[i];
