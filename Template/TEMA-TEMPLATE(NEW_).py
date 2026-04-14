@@ -57,6 +57,14 @@ class BacktestConfig:
     ml_auto_threshold: bool = True
     ml_target_exposure: float = 0.40
 
+    # ML position scalar (separate post-ML scaling)
+    ml_position_scalar: float = 1.0
+    ml_position_scalar_auto: bool = True
+    # Annualized target vol for ML position scalar (e.g., 0.10 = 10%)
+    ml_position_scalar_target_vol: float = 0.10
+    # Safety cap for ML scalar to avoid excessive leverage
+    ml_position_scalar_max: float = 20.0
+
     # Vol-target scaling (train-based)
     vol_target_enabled: bool = True
     vol_target_annual: float = 0.10
@@ -64,7 +72,8 @@ class BacktestConfig:
     vol_target_min_leverage: float = 0.25
     # Which series to reference for realized train volatility when computing vol-target scalar.
     # Accepted values: "ml" (use ML-filtered train returns) or "bl" (use BL train returns).
-    vol_target_reference: str = "ml"
+    # Default changed to "bl" so global vol-target remains BL-referenced while ML gets separate scalar
+    vol_target_reference: str = "bl"
 
     ml_grid_search_enabled: bool = True
     ml_grid_rf_n_estimators: Tuple[int, ...] = (200, 400)
@@ -1024,6 +1033,67 @@ def compute_and_apply_vol_target(
     return scaled_train, scaled_test, scaled_ml_train, scaled_ml_test, diag
 
 
+def compute_and_apply_ml_position_scalar(
+    cfg: BacktestConfig,
+    ml_train_rets: pd.Series,
+    ml_test_rets: pd.Series,
+) -> Tuple[pd.Series, pd.Series, Dict[str, object]]:
+    """
+    Compute a post-ML position scalar and apply it only to ML train/test returns.
+
+    Rules:
+    - train ML vol = std(train_ml_rets) * sqrt(252)
+    - if cfg.ml_position_scalar_auto: scalar = target_vol / train_ml_vol, clipped to [0, cfg.ml_position_scalar_max]
+    - if not auto: scalar = cfg.ml_position_scalar (clipped to max)
+
+    Returns (scaled_ml_train, scaled_ml_test, diagnostics)
+    """
+    diag: Dict[str, object] = {}
+
+    # If ML returns are missing or empty, do nothing
+    if ml_train_rets is None or ml_train_rets.empty:
+        diag["enabled"] = False
+        diag["auto"] = bool(getattr(cfg, "ml_position_scalar_auto", True))
+        return ml_train_rets, ml_test_rets, diag
+
+    train_ml_vol = float(ml_train_rets.std(ddof=0) * np.sqrt(252.0))
+    target_vol = float(getattr(cfg, "ml_position_scalar_target_vol", 0.10))
+
+    unclipped_scalar = None
+    clipped = False
+
+    if bool(getattr(cfg, "ml_position_scalar_auto", True)):
+        # Auto compute scalar from realized train ML volatility
+        if train_ml_vol <= 1e-12 or not np.isfinite(train_ml_vol):
+            unclipped_scalar = float(getattr(cfg, "ml_position_scalar_max", 20.0))
+            scalar = float(getattr(cfg, "ml_position_scalar_max", 20.0))
+            clipped = True
+        else:
+            unclipped_scalar = float(target_vol / train_ml_vol)
+            scalar = float(np.clip(unclipped_scalar, 0.0, getattr(cfg, "ml_position_scalar_max", 20.0)))
+            clipped = not np.isclose(unclipped_scalar, scalar)
+    else:
+        unclipped_scalar = float(getattr(cfg, "ml_position_scalar", 1.0))
+        scalar = float(min(unclipped_scalar, getattr(cfg, "ml_position_scalar_max", 20.0)))
+        clipped = not np.isclose(unclipped_scalar, scalar)
+
+    scaled_ml_train = ml_train_rets * scalar
+    scaled_ml_test = ml_test_rets * scalar
+
+    diag = {
+        "enabled": True,
+        "auto": bool(getattr(cfg, "ml_position_scalar_auto", True)),
+        "scalar": float(scalar),
+        "unclipped_scalar": float(unclipped_scalar),
+        "train_ml_vol": float(train_ml_vol),
+        "target_vol": float(target_vol),
+        "max_scalar": float(getattr(cfg, "ml_position_scalar_max", 20.0)),
+        "clipped": bool(clipped),
+    }
+
+    return scaled_ml_train, scaled_ml_test, diag
+
+
 def save_equity_curve_chart(
     series_map: Dict[str, pd.Series],
     out_path: Path,
@@ -1509,6 +1579,16 @@ def main() -> None:
             pd.DataFrame({"p": ml_test_rets}),
             pd.Series({"p": 1.0}),
         )
+
+    # First, apply ML-specific position scalar (only affects ML-filtered returns)
+    ml_train_rets, ml_test_rets, ml_pos_diag = compute_and_apply_ml_position_scalar(
+        cfg=cfg,
+        ml_train_rets=ml_train_rets,
+        ml_test_rets=ml_test_rets,
+    )
+
+    # Persist ML scalar diagnostics
+    pd.DataFrame([ml_pos_diag]).to_csv(here / "ml_position_scalar_diagnostics.csv", index=False)
 
     # Apply vol-target scaling (train-based) if enabled. This will scale both train/test and ML-filtered portfolios
     scaled_train, scaled_test, scaled_ml_train, scaled_ml_test, vol_diag = compute_and_apply_vol_target(
