@@ -31,6 +31,24 @@ class BacktestConfig:
     vol_target_reference: str = "bl"
     vol_target_apply_to_ml: bool = False
 
+    # Dynamic ensemble controls (Phase 1)
+    ensemble_enabled: bool = False
+    ensemble_lookback: int = 20
+    ensemble_ridge_shrink: float = 0.15
+    ensemble_min_weight: float = 0.05
+    ensemble_max_weight: float = 0.90
+    ensemble_regime_sensitivity: float = 0.40
+    online_learning_enabled: bool = False
+    online_learning_learning_rate: float = 0.10
+    online_learning_l2: float = 1e-4
+    online_learning_seed: int = 42
+
+    # Stress-testing controls (Phase 5)
+    stress_enabled: bool = False
+    stress_seed: int = 42
+    stress_n_paths: int = 200
+    stress_horizon: int = 20
+
     # Costs
     fee_rate: float = 0.0005
     slippage_rate: float = 0.0005

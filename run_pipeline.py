@@ -57,21 +57,46 @@ def run_legacy(run_id: str, out_root: str = "outputs"):
     return {'manifest_path': str(mf), 'out_dir': str(out_dir)}
 
 
-def run_modular(run_id: str, out_root: str = "outputs"):
+def run_modular(
+    run_id: str,
+    out_root: str = "outputs",
+    stress_enabled: bool = False,
+    stress_seed: int = 42,
+    stress_n_paths: int = 200,
+    stress_horizon: int = 20,
+):
     from tema.pipeline import run_pipeline as rp
-    return rp(run_id=run_id, out_root=out_root)
+    from tema.config import BacktestConfig
+
+    cfg = BacktestConfig(
+        stress_enabled=stress_enabled,
+        stress_seed=stress_seed,
+        stress_n_paths=stress_n_paths,
+        stress_horizon=stress_horizon,
+    )
+    return rp(run_id=run_id, cfg=cfg, out_root=out_root)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser("run_pipeline")
     p.add_argument("--run-id", default="manual-run")
     p.add_argument("--legacy", action="store_true")
+    p.add_argument("--stress-enabled", action="store_true")
+    p.add_argument("--stress-seed", type=int, default=42)
+    p.add_argument("--stress-n-paths", type=int, default=200)
+    p.add_argument("--stress-horizon", type=int, default=20)
     args = p.parse_args(argv)
 
     if args.legacy:
         res = run_legacy(args.run_id)
     else:
-        res = run_modular(args.run_id)
+        res = run_modular(
+            args.run_id,
+            stress_enabled=args.stress_enabled,
+            stress_seed=args.stress_seed,
+            stress_n_paths=args.stress_n_paths,
+            stress_horizon=args.stress_horizon,
+        )
     print(res)
     return res
 
