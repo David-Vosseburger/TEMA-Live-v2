@@ -36,6 +36,17 @@ class BacktestConfig:
     grid_validation_min_rows: int = 80
     grid_overfit_penalty: float = 0.5
 
+    # Turnover / rebalance controls (Phase 2b)
+    # Minimum fractional weight change required to trigger a rebalance (e.g., 0.001 = 0.1%)
+    rebalance_min_threshold: float = 0.001
+    # Enable cost-aware rebalance gating: only rebalance when expected alpha > expected costs * multiplier
+    cost_aware_rebalance: bool = False
+    cost_aware_rebalance_multiplier: float = 1.0
+    # Lookback for expected-alpha proxy in cost-aware gating
+    cost_aware_alpha_lookback: int = 20
+    # Penalty applied during selection/optimization: Sharpe - lambda * annualized_turnover
+    turnover_penalty_lambda: float = 0.0
+
     # Black-Litterman parameters
     bl_tau: float = 0.05
     bl_delta: float = 2.5
@@ -58,6 +69,10 @@ class BacktestConfig:
     ml_target_exposure: float = 0.40
 
     # ML position scalar (separate post-ML scaling)
+    ml_position_scalar_method: str = "hmm_prob"
+    # HMM probability scalar shaping: scalar_raw = floor + (ceiling - floor) * p_bull
+    ml_hmm_scalar_floor: float = 0.30
+    ml_hmm_scalar_ceiling: float = 1.50
     ml_position_scalar: float = 1.0
     ml_position_scalar_auto: bool = True
     # Annualized target vol for ML position scalar (e.g., 0.10 = 10%)
@@ -356,6 +371,10 @@ def simulate_batch_returns_and_stats(
     entry_count = np.zeros(n_combos, dtype=np.int32)
     exit_count = np.zeros(n_combos, dtype=np.int32)
 
+    # Turnover/cost tracking
+    total_turnover = np.zeros(n_combos, dtype=np.float64)
+    total_costs = np.zeros(n_combos, dtype=np.float64)
+
     trade_open = np.zeros(n_combos, dtype=bool)
     trade_ret_running = np.zeros(n_combos, dtype=np.float64)
     trade_closed_count = np.zeros(n_combos, dtype=np.int32)
@@ -377,6 +396,10 @@ def simulate_batch_returns_and_stats(
 
         turnover = np.abs(new_pos - pos)
         strat_rets[t, :] -= turnover * cost_rate
+
+        # Track turnover and costs for diagnostics
+        total_turnover += turnover
+        total_costs += turnover * cost_rate
 
         entry_count += (new_pos > pos).astype(np.int32)
         exit_count += (new_pos < pos).astype(np.int32)
@@ -480,6 +503,11 @@ def simulate_batch_returns_and_stats(
     total_trades = trade_closed_count
     trades_per_year = total_trades / years
 
+    # Annualize turnover and costs
+    with np.errstate(invalid='ignore'):
+        annualized_turnover = total_turnover / years
+        annual_costs = total_costs / years
+
     return {
         "strat_rets": strat_rets,
         "total_return": total_return,
@@ -497,6 +525,8 @@ def simulate_batch_returns_and_stats(
         "avg_loss_amount": avg_loss_amount,
         "payoff_ratio": payoff_ratio,
         "trades_per_year": trades_per_year,
+        "annualized_turnover": annualized_turnover,
+        "annual_costs": annual_costs,
     }
 
 
@@ -610,6 +640,8 @@ def _extract_rows_from_stats(
                 "avg_loss_amount": float(stats["avg_loss_amount"][idx]),
                 "payoff_ratio": float(stats["payoff_ratio"][idx]),
                 "trades_per_year": trades_per_year,
+                "annualized_turnover": float(stats.get("annualized_turnover", np.zeros_like(trades_per_year))[idx]) if "annualized_turnover" in stats else float(0.0),
+                "annual_costs": float(stats.get("annual_costs", np.zeros_like(trades_per_year))[idx]) if "annual_costs" in stats else float(0.0),
             }
         )
     return rows
@@ -795,7 +827,8 @@ def build_strategy_returns_for_combo(
         slippage_rate=cfg.slippage_rate,
         freq=cfg.freq,
     )
-    return pd.Series(stats["strat_rets"][:, 0], index=close.index, dtype=float).fillna(0.0)
+    ret_series = pd.Series(stats["strat_rets"][:, 0], index=close.index, dtype=float).fillna(0.0)
+    return ret_series, stats
 
 
 def choose_best_combo_with_validation(
@@ -825,7 +858,26 @@ def choose_best_combo_with_validation(
         raise ValueError("No overlapping shortlist results between subtrain and validation")
 
     gap = np.abs(merged["sharpe_ratio_subtrain"] - merged["sharpe_ratio_val"])
-    merged["selection_score"] = merged["sharpe_ratio_val"] - float(cfg.grid_overfit_penalty) * gap
+    # Apply optional turnover penalty to the selection score (conservative default: 0.0 => no penalty)
+    turnover_penalty = float(getattr(cfg, "turnover_penalty_lambda", 0.0))
+    # merged may contain 'annualized_turnover_val' from the validation stats; fall back to 0.0 if missing
+    annual_turnover_val = merged.get("annualized_turnover_val") if "annualized_turnover_val" in merged.columns else 0.0
+    # Cost-aware rebalance gate: require expected annual return > expected annual costs * multiplier
+    if bool(getattr(cfg, "cost_aware_rebalance", False)) and "annual_costs_val" in merged.columns:
+        multiplier = float(getattr(cfg, "cost_aware_rebalance_multiplier", 1.0))
+        expected_return = merged.get("annualized_return_val") if "annualized_return_val" in merged.columns else 0.0
+        expected_costs = merged.get("annual_costs_val")
+        # Create a boolean mask where requirement holds
+        cost_gate = np.ones(len(merged), dtype=bool)
+        try:
+            cost_gate = expected_return > (expected_costs * multiplier)
+        except Exception:
+            cost_gate = np.ones(len(merged), dtype=bool)
+        # Penalize combos that fail the gate by setting selection_score very low
+        merged["selection_score"] = merged["sharpe_ratio_val"] - float(cfg.grid_overfit_penalty) * gap - turnover_penalty * annual_turnover_val
+        merged.loc[~cost_gate, "selection_score"] = -1e9
+    else:
+        merged["selection_score"] = merged["sharpe_ratio_val"] - float(cfg.grid_overfit_penalty) * gap - turnover_penalty * annual_turnover_val
     best = merged.sort_values(["selection_score", "sharpe_ratio_val"], ascending=[False, False]).iloc[0]
 
     combo = (int(best["ema1_period"]), int(best["ema2_period"]), int(best["ema3_period"]))
@@ -1052,14 +1104,20 @@ def compute_and_apply_ml_position_scalar(
     cfg: BacktestConfig,
     ml_train_rets: pd.Series,
     ml_test_rets: pd.Series,
+    train_port_rets: Optional[pd.Series] = None,
+    test_port_rets: Optional[pd.Series] = None,
+    hmm_engine: Optional[CppHmmEngine] = None,
 ) -> Tuple[pd.Series, pd.Series, Dict[str, object]]:
     """
     Compute a post-ML position scalar and apply it only to ML train/test returns.
 
-    Rules:
-    - train ML vol = std(train_ml_rets) * sqrt(252)
-    - if cfg.ml_position_scalar_auto: scalar = target_vol / train_ml_vol, clipped to [0, cfg.ml_position_scalar_max]
-    - if not auto: scalar = cfg.ml_position_scalar (clipped to max)
+    Default behavior: use HMM bull-state forward-filtered probability as a dynamic, time-varying
+    raw scalar (Variant C). Calibrate an overall factor on the ML *train* set so that the
+    resulting ML-scaled train volatility matches cfg.ml_position_scalar_target_vol.
+
+    Fallbacks:
+    - If HMM inputs or engine are missing, fall back to the original simple vol-based scalar
+      behaviour (keeps backwards compatibility).
 
     Returns (scaled_ml_train, scaled_ml_test, diagnostics)
     """
@@ -1071,25 +1129,203 @@ def compute_and_apply_ml_position_scalar(
         diag["auto"] = bool(getattr(cfg, "ml_position_scalar_auto", True))
         return ml_train_rets, ml_test_rets, diag
 
-    train_ml_vol = float(ml_train_rets.std(ddof=0) * np.sqrt(252.0))
     target_vol = float(getattr(cfg, "ml_position_scalar_target_vol", 0.10))
+    max_scalar = float(getattr(cfg, "ml_position_scalar_max", 50.0))
+    hmm_floor = float(getattr(cfg, "ml_hmm_scalar_floor", 0.30))
+    hmm_ceiling = float(getattr(cfg, "ml_hmm_scalar_ceiling", 1.50))
 
+    method = getattr(cfg, "ml_position_scalar_method", "hmm_prob")
+
+    # Helper: annualized vol
+    def _ann_vol(series: pd.Series) -> float:
+        return float(series.std(ddof=0) * np.sqrt(252.0)) if (series is not None and not series.empty) else 0.0
+
+    def _shape_hmm_raw(raw: pd.Series) -> pd.Series:
+        lo = min(hmm_floor, hmm_ceiling)
+        hi = max(hmm_floor, hmm_ceiling)
+        clipped = raw.clip(lower=0.0, upper=1.0)
+        return (lo + (hi - lo) * clipped).astype(float)
+
+    # Try HMM-probability scalar when requested and feasible
+    if method == "hmm_prob" and train_port_rets is not None and test_port_rets is not None:
+        n_states = int(getattr(cfg, "hmm_n_states", 3))
+
+        def _calibrate_from_raw(
+            raw_train: pd.Series,
+            raw_test: pd.Series,
+            method_name: str,
+            bull_state: int,
+        ) -> Tuple[pd.Series, pd.Series, Dict[str, object]]:
+            pre_vol = _ann_vol(ml_train_rets * raw_train)
+            if pre_vol <= 0 or not np.isfinite(pre_vol):
+                factor = 0.0
+            else:
+                factor = target_vol / pre_vol
+
+            scalar_train_cal = (raw_train * factor).clip(upper=max_scalar)
+            scalar_test = (raw_test * factor).clip(upper=max_scalar)
+            scaled_ml_train = ml_train_rets * scalar_train_cal
+            scaled_ml_test = ml_test_rets * scalar_test
+
+            out_diag: Dict[str, object] = {
+                "enabled": True,
+                "method": method_name,
+                "hmm_n_states": n_states,
+                "bull_state": int(bull_state),
+                "factor": float(factor),
+                "pre_vol": float(pre_vol),
+                "post_vol": float(_ann_vol(scaled_ml_train)),
+                "train_raw_scalar_stats": {
+                    "mean": float(raw_train.mean()),
+                    "median": float(raw_train.median()),
+                    "p90": float(np.percentile(raw_train, 90)) if len(raw_train) > 0 else np.nan,
+                    "max": float(raw_train.max()),
+                },
+                "test_raw_scalar_stats": {
+                    "mean": float(raw_test.mean()),
+                    "median": float(raw_test.median()),
+                    "p90": float(np.percentile(raw_test, 90)) if len(raw_test) > 0 else np.nan,
+                    "max": float(raw_test.max()),
+                },
+                "max_scalar": max_scalar,
+                "hmm_scalar_floor": hmm_floor,
+                "hmm_scalar_ceiling": hmm_ceiling,
+                "applied_scalar_train_mean": float(scalar_train_cal.mean()),
+            }
+            return scaled_ml_train, scaled_ml_test, out_diag
+
+        # Primary path: Python GaussianHMM forward-filtered probabilities (Variant C semantics)
+        try:
+            from hmmlearn.hmm import GaussianHMM
+
+            train_series = train_port_rets.astype(float).fillna(0.0)
+            test_series = test_port_rets.astype(float).fillna(0.0)
+            train_X = train_series.to_numpy(dtype=np.float64).reshape(-1, 1)
+            if train_X.shape[0] < 10:
+                raise ValueError("Not enough samples for python HMM scalar")
+
+            model = GaussianHMM(
+                n_components=n_states,
+                covariance_type="full",
+                random_state=42,
+                n_iter=max(int(getattr(cfg, "hmm_n_iter", 30)), 100),
+            )
+            model.fit(train_X)
+            means = np.asarray(model.means_[:, 0], dtype=float)
+            bull_state = int(np.argmax(means)) if means.size > 0 else 0
+
+            all_series = pd.concat([train_series, test_series])
+            all_series = all_series[~all_series.index.duplicated(keep="last")]
+
+            def _forward_filter_probs_1d(hmm_model: GaussianHMM, x: np.ndarray) -> np.ndarray:
+                n = hmm_model.n_components
+                start = np.asarray(hmm_model.startprob_, dtype=float)
+                trans = np.asarray(hmm_model.transmat_, dtype=float)
+                mu = np.asarray(hmm_model.means_[:, 0], dtype=float)
+
+                cov = np.asarray(hmm_model.covars_, dtype=float)
+                if cov.ndim == 3:
+                    vars_ = cov[:, 0, 0]
+                elif cov.ndim == 2:
+                    vars_ = cov[:, 0]
+                else:
+                    vars_ = cov.reshape(-1)
+                vars_ = np.maximum(vars_, 1e-12)
+
+                x2 = x.reshape(-1, 1)
+                norm = np.sqrt(2.0 * np.pi * vars_)
+                emis = np.exp(-0.5 * ((x2 - mu) ** 2) / vars_) / norm
+                emis = np.maximum(emis, 1e-300)
+
+                probs = np.zeros((x2.shape[0], n), dtype=float)
+                alpha = start * emis[0]
+                s0 = alpha.sum()
+                alpha = np.full(n, 1.0 / n, dtype=float) if s0 <= 0 or not np.isfinite(s0) else alpha / s0
+                probs[0] = alpha
+                for t in range(1, x2.shape[0]):
+                    alpha = (alpha @ trans) * emis[t]
+                    st = alpha.sum()
+                    alpha = np.full(n, 1.0 / n, dtype=float) if st <= 0 or not np.isfinite(st) else alpha / st
+                    probs[t] = alpha
+                return probs
+
+            all_X = all_series.to_numpy(dtype=np.float64).reshape(-1, 1)
+            all_probs = _forward_filter_probs_1d(model, all_X)
+            p_bull_all = pd.Series(all_probs[:, bull_state], index=all_series.index).shift(1)
+            raw_train = p_bull_all.reindex(ml_train_rets.index).fillna(0.0)
+            raw_test = p_bull_all.reindex(ml_test_rets.index).fillna(0.0)
+
+            if float(raw_test.abs().sum()) <= 1e-12:
+                raise ValueError("Python HMM scalar degenerated: test segment all zeros")
+
+            return _calibrate_from_raw(
+                _shape_hmm_raw(raw_train),
+                _shape_hmm_raw(raw_test),
+                "hmm_prob_python",
+                bull_state,
+            )
+        except Exception as exc:
+            diag["python_hmm_error"] = str(exc)
+
+        # Secondary path: C++ HMM forward probabilities
+        if hmm_engine is not None:
+            try:
+                tr = train_port_rets.fillna(0.0).to_numpy(dtype=np.float64)
+                te = test_port_rets.fillna(0.0).to_numpy(dtype=np.float64)
+
+                train_probs, test_probs, means, variances = hmm_engine.fit_forward_probs(
+                    train_returns=tr,
+                    test_returns=te,
+                    n_states=n_states,
+                    n_iter=int(getattr(cfg, "hmm_n_iter", 30)),
+                    var_floor=float(getattr(cfg, "hmm_var_floor", 1e-8)),
+                    trans_sticky=float(getattr(cfg, "hmm_trans_sticky", 0.92)),
+                )
+                bull_state = int(np.argmax(means)) if means.size > 0 else 0
+                raw_train = (
+                    pd.Series(train_probs[:, bull_state], index=train_port_rets.index)
+                    .shift(1)
+                    .reindex(ml_train_rets.index)
+                    .fillna(0.0)
+                )
+                raw_test = (
+                    pd.Series(test_probs[:, bull_state], index=test_port_rets.index)
+                    .shift(1)
+                    .reindex(ml_test_rets.index)
+                    .fillna(0.0)
+                )
+
+                if float(raw_test.abs().sum()) <= 1e-12:
+                    raise ValueError("C++ HMM scalar degenerated: test segment all zeros")
+
+                return _calibrate_from_raw(
+                    _shape_hmm_raw(raw_train),
+                    _shape_hmm_raw(raw_test),
+                    "hmm_prob_cpp",
+                    bull_state,
+                )
+            except Exception as exc:
+                # If anything fails, fall back to original vol-based scalar but record the error
+                diag["hmm_error"] = str(exc)
+
+    # Fallback/compatibility behaviour: original vol-based scalar
+    train_ml_vol = float(ml_train_rets.std(ddof=0) * np.sqrt(252.0))
     unclipped_scalar = None
     clipped = False
 
     if bool(getattr(cfg, "ml_position_scalar_auto", True)):
         # Auto compute scalar from realized train ML volatility
         if train_ml_vol <= 1e-12 or not np.isfinite(train_ml_vol):
-            unclipped_scalar = float(getattr(cfg, "ml_position_scalar_max", 50.0))
-            scalar = float(getattr(cfg, "ml_position_scalar_max", 50.0))
+            unclipped_scalar = max_scalar
+            scalar = max_scalar
             clipped = True
         else:
             unclipped_scalar = float(target_vol / train_ml_vol)
-            scalar = float(np.clip(unclipped_scalar, 0.0, getattr(cfg, "ml_position_scalar_max", 50.0)))
+            scalar = float(np.clip(unclipped_scalar, 0.0, max_scalar))
             clipped = not np.isclose(unclipped_scalar, scalar)
     else:
         unclipped_scalar = float(getattr(cfg, "ml_position_scalar", 1.0))
-        scalar = float(min(unclipped_scalar, getattr(cfg, "ml_position_scalar_max", 50.0)))
+        scalar = float(min(unclipped_scalar, max_scalar))
         clipped = not np.isclose(unclipped_scalar, scalar)
 
     scaled_ml_train = ml_train_rets * scalar
@@ -1097,12 +1333,13 @@ def compute_and_apply_ml_position_scalar(
 
     diag = {
         "enabled": True,
+        "method": "vol_fallback",
         "auto": bool(getattr(cfg, "ml_position_scalar_auto", True)),
         "scalar": float(scalar),
         "unclipped_scalar": float(unclipped_scalar),
         "train_ml_vol": float(train_ml_vol),
         "target_vol": float(target_vol),
-        "max_scalar": float(getattr(cfg, "ml_position_scalar_max", 50.0)),
+        "max_scalar": max_scalar,
         "clipped": bool(clipped),
     }
 
@@ -1189,6 +1426,97 @@ def calibrate_soft_threshold_for_target_exposure(
     return float(np.clip(thr, 0.01, 0.99))
 
 
+def apply_turnover_reduction_gates(
+    raw_scale: np.ndarray,
+    probs: np.ndarray,
+    returns: pd.Series,
+    cfg: BacktestConfig,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Apply turnover reduction directly on exposure path:
+    1) skip tiny exposure deltas (min rebalance threshold),
+    2) optionally require expected alpha to exceed expected cost for risk-increasing changes.
+    """
+    scale = np.asarray(raw_scale, dtype=np.float64).copy()
+    p = np.asarray(probs, dtype=np.float64).copy()
+    if scale.size == 0:
+        return scale, {
+            "threshold_skips": 0.0,
+            "cost_skips": 0.0,
+            "annualized_turnover_raw": 0.0,
+            "annualized_turnover_gated": 0.0,
+            "annualized_cost_drag_raw": 0.0,
+            "annualized_cost_drag_gated": 0.0,
+        }
+
+    n = min(scale.size, p.size, len(returns))
+    scale = np.clip(scale[:n], 0.0, 1.0)
+    p = np.clip(p[:n], 0.0, 1.0)
+    r = returns.iloc[:n].fillna(0.0)
+
+    min_threshold = max(float(getattr(cfg, "rebalance_min_threshold", 0.0)), 0.0)
+    cost_aware = bool(getattr(cfg, "cost_aware_rebalance", False))
+    cost_mult = max(float(getattr(cfg, "cost_aware_rebalance_multiplier", 1.0)), 0.0)
+    lookback = max(int(getattr(cfg, "cost_aware_alpha_lookback", 20)), 2)
+    cost_per_unit = float(cfg.fee_rate + cfg.slippage_rate)
+
+    alpha_base = (
+        r.abs()
+        .rolling(lookback, min_periods=max(2, lookback // 2))
+        .mean()
+        .shift(1)
+        .fillna(0.0)
+        .to_numpy(dtype=np.float64)
+    )
+    signal_strength = np.clip(np.abs(p - 0.5) * 2.0, 0.0, 1.0)
+    expected_alpha = signal_strength * alpha_base
+
+    gated = scale.copy()
+    threshold_skips = 0
+    cost_skips = 0
+    for i in range(1, n):
+        prev = gated[i - 1]
+        proposed = gated[i]
+        delta = proposed - prev
+
+        if np.abs(delta) < min_threshold:
+            gated[i] = prev
+            threshold_skips += 1
+            continue
+
+        # Apply cost-aware gate only when increasing risk; de-risking is always allowed.
+        if cost_aware and delta > 0.0:
+            exp_cost = np.abs(delta) * cost_per_unit
+            exp_alpha = expected_alpha[i] if np.isfinite(expected_alpha[i]) else 0.0
+            if exp_alpha <= (exp_cost * cost_mult):
+                gated[i] = prev
+                cost_skips += 1
+
+    ppy = periods_per_year(cfg.freq)
+    turnover_raw = np.abs(np.diff(scale, prepend=0.0))
+    turnover_gated = np.abs(np.diff(gated, prepend=0.0))
+    annual_turnover_raw = float(np.mean(turnover_raw) * ppy)
+    annual_turnover_gated = float(np.mean(turnover_gated) * ppy)
+
+    diag = {
+        "threshold_skips": float(threshold_skips),
+        "cost_skips": float(cost_skips),
+        "threshold_skip_ratio": float(threshold_skips / max(1, n - 1)),
+        "cost_skip_ratio": float(cost_skips / max(1, n - 1)),
+        "annualized_turnover_raw": annual_turnover_raw,
+        "annualized_turnover_gated": annual_turnover_gated,
+        "annualized_cost_drag_raw": float(annual_turnover_raw * cost_per_unit),
+        "annualized_cost_drag_gated": float(annual_turnover_gated * cost_per_unit),
+        "mean_order_size_raw": float(np.mean(turnover_raw)),
+        "mean_order_size_gated": float(np.mean(turnover_gated)),
+        "median_order_size_raw": float(np.median(turnover_raw)),
+        "median_order_size_gated": float(np.median(turnover_gated)),
+        "p90_order_size_raw": float(np.percentile(turnover_raw, 90)),
+        "p90_order_size_gated": float(np.percentile(turnover_gated, 90)),
+    }
+    return gated, diag
+
+
 def apply_hmm_softprob_rf_strategy(
     train_port_rets: pd.Series,
     test_port_rets: pd.Series,
@@ -1234,8 +1562,21 @@ def apply_hmm_softprob_rf_strategy(
             fallback_threshold=threshold,
         )
 
-    scale_train = np.clip((p_train - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
-    scale_test = np.clip((p_test - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
+    scale_train_raw = np.clip((p_train - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
+    scale_test_raw = np.clip((p_test - threshold) / max(1.0 - threshold, 1e-9), 0.0, 1.0)
+
+    scale_all_raw = np.concatenate([scale_train_raw, scale_test_raw])
+    probs_all = np.concatenate([p_train, p_test])
+    returns_all = pd.concat([tr, te], axis=0)
+    scale_all_gated, gate_diag = apply_turnover_reduction_gates(
+        raw_scale=scale_all_raw,
+        probs=probs_all,
+        returns=returns_all,
+        cfg=cfg,
+    )
+    n_train = len(tr)
+    scale_train = scale_all_gated[:n_train]
+    scale_test = scale_all_gated[n_train:]
 
     ml_train = pd.Series(tr.to_numpy(dtype=np.float64) * scale_train, index=tr.index, name="portfolio_return_ml")
     ml_test = pd.Series(te.to_numpy(dtype=np.float64) * scale_test, index=te.index, name="portfolio_return_ml")
@@ -1251,7 +1592,14 @@ def apply_hmm_softprob_rf_strategy(
         "ml_target_exposure": float(cfg.ml_target_exposure),
         "train_avg_exposure": float(scale_train.mean()),
         "test_avg_exposure": float(scale_test.mean()),
+        "train_avg_exposure_raw": float(np.mean(scale_train_raw)),
+        "test_avg_exposure_raw": float(np.mean(scale_test_raw)),
+        "rebalance_min_threshold": float(getattr(cfg, "rebalance_min_threshold", 0.0)),
+        "cost_aware_rebalance": float(1.0 if bool(getattr(cfg, "cost_aware_rebalance", False)) else 0.0),
+        "cost_aware_rebalance_multiplier": float(getattr(cfg, "cost_aware_rebalance_multiplier", 1.0)),
+        "cost_aware_alpha_lookback": float(getattr(cfg, "cost_aware_alpha_lookback", 20)),
     }
+    diag.update({f"gate_{k}": float(v) for k, v in gate_diag.items()})
 
     hmm_df = pd.DataFrame(
         {
@@ -1357,6 +1705,15 @@ def run_ml_parameter_grid_search(
     return df
 
 
+def stat_value_as_float(stats: Optional[Dict[str, np.ndarray]], key: str, default: float = np.nan) -> float:
+    if stats is None or key not in stats:
+        return float(default)
+    arr = np.asarray(stats.get(key))
+    if arr.size == 0:
+        return float(default)
+    return float(arr.reshape(-1)[0])
+
+
 def run_asset_pipeline(
     asset_file: Path,
     combos: Sequence[Tuple[int, int, int]],
@@ -1398,8 +1755,8 @@ def run_asset_pipeline(
         so_path=so_path,
     )
 
-    train_returns = build_strategy_returns_for_combo(train_close, best_combo, cfg, so_path)
-    test_returns = build_strategy_returns_for_combo(test_close, best_combo, cfg, so_path)
+    train_returns, train_stats = build_strategy_returns_for_combo(train_close, best_combo, cfg, so_path)
+    test_returns, test_stats = build_strategy_returns_for_combo(test_close, best_combo, cfg, so_path)
     train_bh_returns = train_close.pct_change().fillna(0.0).astype(float)
     test_bh_returns = test_close.pct_change().fillna(0.0).astype(float)
 
@@ -1417,7 +1774,12 @@ def run_asset_pipeline(
         "train_total_return": float(train_eval["total_return"]),
         "train_annualized_return": float(train_eval["annualized_return"]),
         "train_max_drawdown": float(train_eval["max_drawdown"]),
-        "train_trades": np.nan,
+        "train_trades": int(round(stat_value_as_float(train_stats, "total_trades", 0.0))),
+        "train_annualized_turnover": stat_value_as_float(train_stats, "annualized_turnover", np.nan),
+        "train_annual_costs": stat_value_as_float(train_stats, "annual_costs", np.nan),
+        "test_trades": int(round(stat_value_as_float(test_stats, "total_trades", 0.0))),
+        "test_annualized_turnover": stat_value_as_float(test_stats, "annualized_turnover", np.nan),
+        "test_annual_costs": stat_value_as_float(test_stats, "annual_costs", np.nan),
         "subtrain_sharpe": float(selection_info["subtrain_sharpe"]),
         "val_sharpe": float(selection_info["val_sharpe"]),
         "selection_score": float(selection_info["selection_score"]),
@@ -1597,9 +1959,12 @@ def main() -> None:
 
     # First, apply ML-specific position scalar (only affects ML-filtered returns)
     ml_train_rets, ml_test_rets, ml_pos_diag = compute_and_apply_ml_position_scalar(
-        cfg=cfg,
+        cfg=selected_ml_cfg,
         ml_train_rets=ml_train_rets,
         ml_test_rets=ml_test_rets,
+        train_port_rets=train_port_rets,
+        test_port_rets=test_port_rets,
+        hmm_engine=hmm_engine,
     )
 
     # Persist ML scalar diagnostics
