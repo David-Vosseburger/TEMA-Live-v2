@@ -1795,6 +1795,26 @@ def run_asset_pipeline(
 
 def main() -> None:
     cfg = BacktestConfig()
+    # Lightweight environment overrides to support isolated ablation experiments.
+    # Supported env vars (set only the ones you need):
+    #  REB_MIN_THRESHOLD - float -> overrides cfg.rebalance_min_threshold
+    #  COST_AWARE_REBALANCE - bool-like -> overrides cfg.cost_aware_rebalance
+    #  COST_AWARE_REBALANCE_MULTIPLIER - float -> overrides cfg.cost_aware_rebalance_multiplier
+    #  TURNOVER_PENALTY_LAMBDA - float -> overrides cfg.turnover_penalty_lambda
+    try:
+        env = os.environ
+        if "REB_MIN_THRESHOLD" in env:
+            cfg.rebalance_min_threshold = float(env["REB_MIN_THRESHOLD"])
+        if "COST_AWARE_REBALANCE" in env:
+            v = str(env["COST_AWARE_REBALANCE"]).strip().lower()
+            cfg.cost_aware_rebalance = v in ("1", "true", "yes", "on")
+        if "COST_AWARE_REBALANCE_MULTIPLIER" in env:
+            cfg.cost_aware_rebalance_multiplier = float(env["COST_AWARE_REBALANCE_MULTIPLIER"])
+        if "TURNOVER_PENALTY_LAMBDA" in env:
+            cfg.turnover_penalty_lambda = float(env["TURNOVER_PENALTY_LAMBDA"])
+    except Exception as exc:
+        print(f"Warning: failed to apply env overrides: {exc}")
+
     max_workers = resolve_max_workers(cfg)
     grid_cfg = GridConfig(
         ema1_periods=list(range(4, 40, 3)),
