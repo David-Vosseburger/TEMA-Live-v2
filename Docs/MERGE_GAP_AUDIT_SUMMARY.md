@@ -5,6 +5,31 @@
 **Date Completed:** 2025-01-25  
 **Full Report:** `/Docs/MERGE_GAP_AUDIT.txt` (916 lines)
 
+## Current status (post 33391df+)
+
+### Completed modules/phases
+- Data loading & preprocessing (implemented)
+- EMA signals & signal generation
+- Portfolio metrics & Black-Litterman construction
+- Vol-target scaling
+- ML feature generation & ML pipeline (implemented/verified for core paths)
+- C++ wrappers (signal & HMM) verified
+- Reporting & visualization
+
+### Remaining extraction work (M2-M7 track now executing)
+- M2: Asset pipeline orchestration (run_asset_pipeline)
+- M3: OOS combo selection (choose_best_combo_with_validation) — BLOCKING for full pipeline
+- M4: Cost-aware rebalancing gates (apply_turnover_reduction_gates) — BLOCKING (Phase 2b)
+- M5: Grid validation & subtrain/validation split
+- M6: Multi-asset orchestration & aggregation
+- M7: Turnover penalty, diagnostics & parity verification
+
+### Current run/CLI structure and known limitations
+- Primary CLI: run_pipeline.py — default path executes the modular pipeline (tema.pipeline.run_pipeline)
+- --legacy flag prepares and optionally runs the legacy monolith; actual execution requires env var TEMA_RUN_LEGACY_EXECUTE=1
+- The CLI writes a per-run manifest in outputs/<run_id>/manifest.json indicating whether legacy execution occurred
+- Known limitations: several src/tema directories currently contain only compiled artifacts (.pyc) or partial implementations; OOS selection and cost-aware gates remain unextracted and block parity with the legacy monolith; legacy execution is opt-in to keep CI deterministic.
+
 ## What Was Completed
 
 ### 1. **Comprehensive Capability Enumeration** ✅

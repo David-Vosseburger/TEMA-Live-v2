@@ -64,6 +64,12 @@ def run_modular(
     stress_seed: int = 42,
     stress_n_paths: int = 200,
     stress_horizon: int = 20,
+    modular_data_signals_enabled: bool = False,
+    modular_portfolio_enabled: bool = False,
+    data_path: str | None = None,
+    ml_enabled: bool = True,
+    ml_modular_path_enabled: bool = False,
+    ml_probability_threshold: float = 0.0,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
@@ -73,6 +79,12 @@ def run_modular(
         stress_seed=stress_seed,
         stress_n_paths=stress_n_paths,
         stress_horizon=stress_horizon,
+        modular_data_signals_enabled=modular_data_signals_enabled,
+        portfolio_modular_enabled=modular_portfolio_enabled,
+        data_path=data_path,
+        ml_enabled=ml_enabled,
+        ml_modular_path_enabled=ml_modular_path_enabled,
+        ml_probability_threshold=ml_probability_threshold,
     )
     return rp(run_id=run_id, cfg=cfg, out_root=out_root)
 
@@ -85,6 +97,12 @@ def main(argv=None):
     p.add_argument("--stress-seed", type=int, default=42)
     p.add_argument("--stress-n-paths", type=int, default=200)
     p.add_argument("--stress-horizon", type=int, default=20)
+    p.add_argument("--modular-data-signals", action="store_true")
+    p.add_argument("--modular-portfolio", action="store_true")
+    p.add_argument("--data-path", default=None)
+    p.add_argument("--ml-disabled", action="store_true")
+    p.add_argument("--ml-modular-path", action="store_true")
+    p.add_argument("--ml-prob-threshold", type=float, default=0.0)
     args = p.parse_args(argv)
 
     if args.legacy:
@@ -96,6 +114,12 @@ def main(argv=None):
             stress_seed=args.stress_seed,
             stress_n_paths=args.stress_n_paths,
             stress_horizon=args.stress_horizon,
+            modular_data_signals_enabled=args.modular_data_signals,
+            modular_portfolio_enabled=args.modular_portfolio,
+            data_path=args.data_path,
+            ml_enabled=(not args.ml_disabled),
+            ml_modular_path_enabled=args.ml_modular_path,
+            ml_probability_threshold=args.ml_prob_threshold,
         )
     print(res)
     return res

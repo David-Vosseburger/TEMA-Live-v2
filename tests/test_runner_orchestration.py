@@ -14,6 +14,7 @@ def test_modular_runner_creates_manifest(tmp_path):
     data = json.loads(mf_path.read_text())
     assert data.get("run_id") == run_id
     assert "artifacts" in data
+    assert "performance" in data["artifacts"]
 
 
 def test_legacy_fallback_creates_manifest(tmp_path):

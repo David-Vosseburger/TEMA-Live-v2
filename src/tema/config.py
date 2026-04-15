@@ -4,6 +4,27 @@ from typing import Optional
 
 @dataclass
 class BacktestConfig:
+    # Modular data/signals toggle (safe-by-default off)
+    modular_data_signals_enabled: bool = False
+    data_path: Optional[str] = None
+    data_max_assets: int = 3
+    data_min_rows: int = 30
+    data_train_ratio: float = 0.7
+    signal_fast_period: int = 5
+    signal_slow_period: int = 20
+    signal_method: str = "ema"
+    signal_use_cpp: bool = False
+    portfolio_modular_enabled: bool = False
+    portfolio_method: str = "bl"
+    portfolio_use_hrp_hook: bool = False
+    portfolio_use_nco_hook: bool = False
+    portfolio_cov_shrinkage: float = 0.15
+    portfolio_bl_tau: float = 0.05
+    portfolio_bl_view_confidence: float = 0.65
+    portfolio_risk_aversion: float = 2.5
+    portfolio_min_weight: float = 0.0
+    portfolio_max_weight: float = 1.0
+
     # Turnover / rebalance controls (Phase 2b)
     rebalance_min_threshold: float = 0.001
     cost_aware_rebalance: bool = False
@@ -15,9 +36,14 @@ class BacktestConfig:
 
     # ML / position scalar controls
     ml_enabled: bool = True
+    ml_modular_path_enabled: bool = False
     ml_position_scalar_method: str = "hmm_prob"
     ml_hmm_scalar_floor: float = 0.30
     ml_hmm_scalar_ceiling: float = 1.50
+    ml_probability_threshold: float = 0.0
+    ml_rf_alpha_weight: float = 1.0
+    ml_rf_regime_weight: float = 0.5
+    ml_rf_bias: float = 0.0
     ml_position_scalar: float = 1.0
     ml_position_scalar_auto: bool = True
     ml_position_scalar_target_vol: float = 0.10
