@@ -31,6 +31,8 @@ def _annualization_factor(freq: str) -> float:
 
 
 def _effective_data_max_assets(cfg: BacktestConfig) -> tuple[Optional[int], bool]:
+    if cfg.template_default_universe:
+        return None, True
     max_assets = cfg.data_max_assets
     if (
         cfg.modular_data_signals_enabled
@@ -43,13 +45,15 @@ def _effective_data_max_assets(cfg: BacktestConfig) -> tuple[Optional[int], bool
 
 def _load_data_context(cfg: BacktestConfig) -> dict:
     max_assets, full_universe_override = _effective_data_max_assets(cfg)
+    min_rows = 400 if cfg.template_default_universe else cfg.data_min_rows
+    train_ratio = 0.60 if cfg.template_default_universe else cfg.data_train_ratio
     price_df = load_price_panel(
         data_path=cfg.data_path,
         root=os.getcwd(),
         max_assets=max_assets,
-        min_rows=max(3, cfg.data_min_rows),
+        min_rows=max(3, min_rows),
     )
-    train_df, test_df = split_train_test(price_df, train_ratio=cfg.data_train_ratio)
+    train_df, test_df = split_train_test(price_df, train_ratio=train_ratio)
     if train_df.empty or test_df.empty:
         raise ValueError("train/test split produced empty partition")
     train_returns = (
@@ -65,6 +69,8 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
         "train_returns": train_returns,
         "max_assets_used": max_assets,
         "full_universe_override": full_universe_override,
+        "min_rows_used": int(max(3, min_rows)),
+        "train_ratio_used": float(train_ratio),
     }
 
 
@@ -280,6 +286,9 @@ def _portfolio_stage(
                 "test_rows": int(len(test_df)),
                 "data_max_assets_used": ctx["max_assets_used"],
                 "full_universe_override": bool(ctx["full_universe_override"]),
+                "template_default_universe": bool(cfg.template_default_universe),
+                "data_min_rows_used": int(ctx["min_rows_used"]),
+                "data_train_ratio_used": float(ctx["train_ratio_used"]),
                 "portfolio_modular_enabled": bool(cfg.portfolio_modular_enabled),
                 "portfolio_method": portfolio_method,
                 "portfolio_allocation_fallback_used": portfolio_alloc_fallback,

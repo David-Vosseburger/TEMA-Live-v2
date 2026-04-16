@@ -11,6 +11,8 @@ class BacktestConfig:
     data_full_universe_for_parity: bool = True
     data_min_rows: int = 30
     data_train_ratio: float = 0.7
+    # Template-style universe profile: merged_d1 source, min_history_rows=400, train_ratio=0.60, full asset set
+    template_default_universe: bool = False
     signal_fast_period: int = 5
     signal_slow_period: int = 20
     signal_method: str = "ema"

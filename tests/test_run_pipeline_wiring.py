@@ -54,6 +54,82 @@ def test_run_modular_wires_new_knobs(monkeypatch):
     assert cfg.vol_target_apply_to_ml is True
 
 
+def test_run_modular_template_default_universe_sets_profile_defaults(monkeypatch):
+    captured = {}
+
+    def _fake_pipeline(run_id, cfg, out_root):
+        captured["cfg"] = cfg
+        return {"manifest_path": "x", "out_dir": "y", "manifest": {"run_id": run_id, "artifacts": []}}
+
+    import tema.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "run_pipeline", _fake_pipeline)
+    run_pipeline.run_modular(
+        run_id="template-universe",
+        out_root="outputs",
+        template_default_universe=True,
+        data_path=None,
+    )
+
+    cfg = captured["cfg"]
+    assert cfg.template_default_universe is True
+    assert cfg.data_path == "merged_d1"
+
+
+def test_run_modular_template_default_universe_keeps_explicit_data_path(monkeypatch):
+    captured = {}
+
+    def _fake_pipeline(run_id, cfg, out_root):
+        captured["cfg"] = cfg
+        return {"manifest_path": "x", "out_dir": "y", "manifest": {"run_id": run_id, "artifacts": []}}
+
+    import tema.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "run_pipeline", _fake_pipeline)
+    run_pipeline.run_modular(
+        run_id="template-universe-explicit",
+        out_root="outputs",
+        template_default_universe=True,
+        data_path="custom_data",
+    )
+
+    cfg = captured["cfg"]
+    assert cfg.template_default_universe is True
+    assert cfg.data_path == "custom_data"
+
+
+def test_main_passes_out_root_to_modular(monkeypatch):
+    captured = {}
+
+    def _fake_run_modular(run_id, out_root="outputs", **kwargs):
+        captured["run_id"] = run_id
+        captured["out_root"] = out_root
+        return {"run_id": run_id}
+
+    monkeypatch.setattr(run_pipeline, "run_modular", _fake_run_modular)
+    run_pipeline.main(["--run-id", "mod-main", "--out-root", "custom-out"])
+
+    assert captured["run_id"] == "mod-main"
+    assert captured["out_root"] == "custom-out"
+
+
+def test_main_passes_out_root_to_legacy(monkeypatch):
+    captured = {}
+
+    def _fake_run_legacy(run_id, out_root="outputs", legacy_metrics_dataset=None):
+        captured["run_id"] = run_id
+        captured["out_root"] = out_root
+        captured["legacy_metrics_dataset"] = legacy_metrics_dataset
+        return {"run_id": run_id}
+
+    monkeypatch.setattr(run_pipeline, "run_legacy", _fake_run_legacy)
+    run_pipeline.main(["--run-id", "legacy-main", "--legacy", "--out-root", "custom-out", "--legacy-metrics-dataset", "test"])
+
+    assert captured["run_id"] == "legacy-main"
+    assert captured["out_root"] == "custom-out"
+    assert captured["legacy_metrics_dataset"] == "test"
+
+
 def test_run_legacy_writes_performance_manifest(tmp_path, monkeypatch):
     fake_root = tmp_path / "repo"
     template_dir = fake_root / "Template"

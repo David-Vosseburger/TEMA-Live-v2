@@ -42,6 +42,7 @@ def main():
     p.add_argument("--fast", action="store_true", help="Pass conservative flags to modular pipeline to speed execution")
     p.add_argument("--modular-data-signals", action="store_true", help="Enable modular data/signals path")
     p.add_argument("--modular-portfolio", action="store_true", help="Enable modular portfolio allocator")
+    p.add_argument("--template-default-universe", action="store_true", help="Use template-like universe defaults in modular run")
     p.add_argument("--data-max-assets", type=int, default=3, help="Cap modular universe size")
     p.add_argument("--disable-full-universe-override", action="store_true", help="Disable parity override that expands universe when data/signals enabled")
     p.add_argument("--ml-modular-path", action="store_true", help="Enable modular ML path")
@@ -69,13 +70,15 @@ def main():
     mod_id = f"{run_id}-modular"
     legacy_id = f"{run_id}-legacy"
 
-    mod_args = ["--run-id", mod_id]
+    mod_args = ["--run-id", mod_id, "--out-root", out_root]
     if args.fast:
         mod_args += ["--ml-disabled", "--stress-n-paths", "1", "--stress-horizon", "1"]
     if args.modular_data_signals:
         mod_args += ["--modular-data-signals"]
     if args.modular_portfolio:
         mod_args += ["--modular-portfolio"]
+    if args.template_default_universe:
+        mod_args += ["--template-default-universe"]
     if args.ml_modular_path:
         mod_args += ["--ml-modular-path"]
     if args.vol_target_apply_to_ml:
@@ -101,7 +104,7 @@ def main():
     if args.execute_legacy:
         env = os.environ.copy()
         env["TEMA_RUN_LEGACY_EXECUTE"] = "1"
-        legacy_args = ["--run-id", legacy_id, "--legacy"]
+        legacy_args = ["--run-id", legacy_id, "--out-root", out_root, "--legacy"]
         if args.legacy_metrics_dataset:
             legacy_args += ["--legacy-metrics-dataset", str(args.legacy_metrics_dataset)]
         rc_legacy = _run_pipeline(legacy_args, env=env)
@@ -110,7 +113,7 @@ def main():
         rc_mod = _run_pipeline(mod_args)
         # create a manifest placeholder for legacy (run_pipeline will create a manifest when not executing)
         # call run_pipeline.py without TEMA_RUN_LEGACY_EXECUTE so it writes manifest with legacy_executed False
-        legacy_args = ["--run-id", legacy_id, "--legacy"]
+        legacy_args = ["--run-id", legacy_id, "--out-root", out_root, "--legacy"]
         rc_legacy = _run_pipeline(legacy_args)
 
     # compose manifest paths

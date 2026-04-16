@@ -171,11 +171,16 @@ def run_modular(
     ml_hmm_scalar_floor: float = 0.30,
     ml_hmm_scalar_ceiling: float = 1.50,
     vol_target_apply_to_ml: bool = False,
+    template_default_universe: bool = False,
     parity_metrics_bridge: bool = False,
     parity_metrics_dataset: str | None = None,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
+
+    effective_data_path = data_path
+    if template_default_universe and effective_data_path is None:
+        effective_data_path = "merged_d1"
 
     cfg = BacktestConfig(
         stress_enabled=stress_enabled,
@@ -184,7 +189,7 @@ def run_modular(
         stress_horizon=stress_horizon,
         modular_data_signals_enabled=modular_data_signals_enabled,
         portfolio_modular_enabled=modular_portfolio_enabled,
-        data_path=data_path,
+        data_path=effective_data_path,
         ml_enabled=ml_enabled,
         ml_modular_path_enabled=ml_modular_path_enabled,
         ml_probability_threshold=ml_probability_threshold,
@@ -197,6 +202,7 @@ def run_modular(
         ml_hmm_scalar_floor=ml_hmm_scalar_floor,
         ml_hmm_scalar_ceiling=ml_hmm_scalar_ceiling,
         vol_target_apply_to_ml=vol_target_apply_to_ml,
+        template_default_universe=template_default_universe,
     )
     res = rp(run_id=run_id, cfg=cfg, out_root=out_root)
     bridge_enabled = bool(parity_metrics_bridge or os.environ.get("TEMA_PARITY_METRICS_BRIDGE", "0") == "1")
@@ -212,6 +218,7 @@ def run_modular(
 def main(argv=None):
     p = argparse.ArgumentParser("run_pipeline")
     p.add_argument("--run-id", default="manual-run")
+    p.add_argument("--out-root", default="outputs")
     p.add_argument("--legacy", action="store_true")
     p.add_argument("--stress-enabled", action="store_true")
     p.add_argument("--stress-seed", type=int, default=42)
@@ -232,15 +239,17 @@ def main(argv=None):
     p.add_argument("--ml-hmm-scalar-floor", type=float, default=0.30)
     p.add_argument("--ml-hmm-scalar-ceiling", type=float, default=1.50)
     p.add_argument("--vol-target-apply-to-ml", action="store_true")
+    p.add_argument("--template-default-universe", action="store_true", help="Use template-like universe defaults (merged_d1, min_rows=400, train_ratio=0.60, full asset set)")
     p.add_argument("--parity-metrics-bridge", action="store_true", help="Override modular performance metrics with latest legacy metrics CSV for strict parity validation")
     p.add_argument("--legacy-metrics-dataset", default=None, help="Dataset row to read from Template/bl_portfolio_metrics.csv (e.g. test, test_ml)")
     args = p.parse_args(argv)
 
     if args.legacy:
-        res = run_legacy(args.run_id, legacy_metrics_dataset=args.legacy_metrics_dataset)
+        res = run_legacy(args.run_id, out_root=args.out_root, legacy_metrics_dataset=args.legacy_metrics_dataset)
     else:
         res = run_modular(
             args.run_id,
+            out_root=args.out_root,
             stress_enabled=args.stress_enabled,
             stress_seed=args.stress_seed,
             stress_n_paths=args.stress_n_paths,
@@ -260,6 +269,7 @@ def main(argv=None):
             ml_hmm_scalar_floor=args.ml_hmm_scalar_floor,
             ml_hmm_scalar_ceiling=args.ml_hmm_scalar_ceiling,
             vol_target_apply_to_ml=args.vol_target_apply_to_ml,
+            template_default_universe=args.template_default_universe,
             parity_metrics_bridge=args.parity_metrics_bridge,
             parity_metrics_dataset=args.legacy_metrics_dataset,
         )

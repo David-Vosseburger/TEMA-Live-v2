@@ -149,3 +149,41 @@ def test_pipeline_uses_full_universe_override_for_default_cap(tmp_path):
 
     assert portfolio_info["full_universe_override"] is True
     assert len(portfolio_info["assets"]) == 4
+
+
+def test_pipeline_template_default_universe_applies_template_data_profile(tmp_path):
+    data_dir = tmp_path / "merged_d1"
+    out_root = tmp_path / "outputs"
+    data_dir.mkdir()
+
+    long_rows = ["timestamp,close_mid"]
+    for i in range(500):
+        ts = 1677628800000 + (i * 86400000)
+        long_rows.append(f"{ts},{100 + i}")
+    _write_csv(data_dir / "long_d1_merged.csv", "\n".join(long_rows) + "\n")
+
+    short_rows = ["timestamp,close_mid"]
+    for i in range(350):
+        ts = 1677628800000 + (i * 86400000)
+        short_rows.append(f"{ts},{200 + i}")
+    _write_csv(data_dir / "short_d1_merged.csv", "\n".join(short_rows) + "\n")
+
+    cfg = BacktestConfig(
+        modular_data_signals_enabled=True,
+        portfolio_modular_enabled=True,
+        data_path=str(data_dir),
+        data_min_rows=4,
+        data_train_ratio=0.8,
+        template_default_universe=True,
+    )
+    res = run_pipeline(run_id="template-universe-profile", cfg=cfg, out_root=str(out_root))
+    portfolio_info = json.loads((Path(res["out_dir"]) / "portfolio_info.json").read_text(encoding="utf-8"))
+    performance = json.loads((Path(res["out_dir"]) / "performance.json").read_text(encoding="utf-8"))
+
+    assert portfolio_info["template_default_universe"] is True
+    assert portfolio_info["data_min_rows_used"] == 400
+    assert portfolio_info["data_train_ratio_used"] == 0.60
+    assert portfolio_info["full_universe_override"] is True
+    assert portfolio_info["assets"] == ["long"]
+    assert performance["source"]["train_rows"] == 300
+    assert performance["source"]["test_rows"] == 200
