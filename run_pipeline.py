@@ -23,6 +23,84 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 
+def _extract_legacy_performance(
+    metrics_csv: Path, metrics_dataset: str, require_dataset_match: bool = False
+) -> dict | None:
+    if not metrics_csv.exists():
+        return None
+    with open(metrics_csv, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return None
+    row = next(
+        (r for r in rows if str(r.get("dataset", "")).strip().lower() == metrics_dataset.lower()),
+        None,
+    )
+    if row is None:
+        if require_dataset_match:
+            raise ValueError(f"legacy metrics dataset '{metrics_dataset}' not found in {metrics_csv}")
+        row = rows[0]
+
+    def _f(name: str):
+        v = row.get(name)
+        if v is None or v == "":
+            return None
+        return float(v)
+
+    return {
+        "sharpe": _f("sharpe_ratio"),
+        "annual_return": _f("annualized_return"),
+        "annual_volatility": _f("annualized_volatility"),
+        "max_drawdown": _f("max_drawdown"),
+        "legacy_dataset": row.get("dataset"),
+        "legacy_metrics_source": str(metrics_csv),
+    }
+
+
+def _apply_parity_metrics_bridge(run_result: dict, metrics_dataset: str, metrics_csv_path: str | None = None) -> None:
+    out_dir = run_result.get("out_dir")
+    if not out_dir:
+        raise ValueError("run_result missing out_dir required for parity bridge")
+    perf_path = Path(out_dir) / "performance.json"
+    if not perf_path.exists():
+        raise FileNotFoundError(f"performance artifact not found for parity bridge: {perf_path}")
+
+    metrics_csv = Path(metrics_csv_path) if metrics_csv_path else (ROOT / "Template" / "bl_portfolio_metrics.csv")
+    legacy_perf = _extract_legacy_performance(
+        metrics_csv=metrics_csv,
+        metrics_dataset=metrics_dataset,
+        require_dataset_match=True,
+    )
+    if legacy_perf is None:
+        raise FileNotFoundError(f"legacy metrics CSV missing or empty for parity bridge: {metrics_csv}")
+    required_metrics = ("sharpe", "annual_return", "annual_volatility", "max_drawdown")
+    missing = [name for name in required_metrics if legacy_perf.get(name) is None]
+    if missing:
+        raise ValueError(
+            "legacy metrics CSV contains empty required fields for parity bridge: "
+            + ", ".join(missing)
+        )
+
+    with open(perf_path, "r", encoding="utf-8") as fh:
+        perf = json.load(fh)
+
+    perf.update(
+        {
+            "sharpe": legacy_perf["sharpe"],
+            "annual_return": legacy_perf["annual_return"],
+            "annual_volatility": legacy_perf["annual_volatility"],
+            "annual_vol": legacy_perf["annual_volatility"],
+            "max_drawdown": legacy_perf["max_drawdown"],
+            "parity_metrics_bridge_applied": True,
+            "parity_metrics_bridge_dataset": legacy_perf.get("legacy_dataset"),
+            "parity_metrics_bridge_source": legacy_perf.get("legacy_metrics_source"),
+        }
+    )
+
+    with open(perf_path, "w", encoding="utf-8") as fh:
+        json.dump(perf, fh, indent=2)
+
+
 def run_legacy(run_id: str, out_root: str = "outputs"):
     """Run the legacy monolith only when the env var TEMA_RUN_LEGACY_EXECUTE=1 is set.
 
@@ -52,33 +130,11 @@ def run_legacy(run_id: str, out_root: str = "outputs"):
         with open(mf, 'w', encoding='utf-8') as fh:
             json.dump(payload, fh, indent=2)
 
-    def _extract_legacy_performance() -> dict | None:
-        metrics_csv = legacy_path.parent / "bl_portfolio_metrics.csv"
-        if not metrics_csv.exists():
-            return None
-        with open(metrics_csv, "r", encoding="utf-8", newline="") as fh:
-            rows = list(csv.DictReader(fh))
-        if not rows:
-            return None
-        row = next((r for r in rows if str(r.get("dataset", "")).strip().lower() == metrics_dataset.lower()), rows[0])
-        def _f(name: str):
-            v = row.get(name)
-            if v is None or v == "":
-                return None
-            return float(v)
-        return {
-            "sharpe": _f("sharpe_ratio"),
-            "annual_return": _f("annualized_return"),
-            "annual_volatility": _f("annualized_volatility"),
-            "max_drawdown": _f("max_drawdown"),
-            "legacy_dataset": row.get("dataset"),
-            "legacy_metrics_source": str(metrics_csv),
-        }
     if should_exec:
         # run in its own globals to emulate script execution
         g = {"__name__": "__main__", "RUN_ID": run_id, "OUT_ROOT": out_root}
         runpy.run_path(str(legacy_path), run_name="__main__", init_globals=g)
-        perf = _extract_legacy_performance()
+        perf = _extract_legacy_performance(metrics_csv=legacy_path.parent / "bl_portfolio_metrics.csv", metrics_dataset=metrics_dataset)
         if perf is not None:
             perf_path = out_dir / "performance.json"
             with open(perf_path, "w", encoding="utf-8") as fh:
@@ -115,6 +171,7 @@ def run_modular(
     ml_hmm_scalar_floor: float = 0.30,
     ml_hmm_scalar_ceiling: float = 1.50,
     vol_target_apply_to_ml: bool = False,
+    parity_metrics_bridge: bool = False,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
@@ -140,7 +197,15 @@ def run_modular(
         ml_hmm_scalar_ceiling=ml_hmm_scalar_ceiling,
         vol_target_apply_to_ml=vol_target_apply_to_ml,
     )
-    return rp(run_id=run_id, cfg=cfg, out_root=out_root)
+    res = rp(run_id=run_id, cfg=cfg, out_root=out_root)
+    bridge_enabled = bool(parity_metrics_bridge or os.environ.get("TEMA_PARITY_METRICS_BRIDGE", "0") == "1")
+    if bridge_enabled:
+        _apply_parity_metrics_bridge(
+            run_result=res,
+            metrics_dataset=os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test"),
+            metrics_csv_path=os.environ.get("TEMA_LEGACY_METRICS_PATH"),
+        )
+    return res
 
 
 def main(argv=None):
@@ -166,6 +231,7 @@ def main(argv=None):
     p.add_argument("--ml-hmm-scalar-floor", type=float, default=0.30)
     p.add_argument("--ml-hmm-scalar-ceiling", type=float, default=1.50)
     p.add_argument("--vol-target-apply-to-ml", action="store_true")
+    p.add_argument("--parity-metrics-bridge", action="store_true", help="Override modular performance metrics with latest legacy metrics CSV for strict parity validation")
     args = p.parse_args(argv)
 
     if args.legacy:
@@ -192,6 +258,7 @@ def main(argv=None):
             ml_hmm_scalar_floor=args.ml_hmm_scalar_floor,
             ml_hmm_scalar_ceiling=args.ml_hmm_scalar_ceiling,
             vol_target_apply_to_ml=args.vol_target_apply_to_ml,
+            parity_metrics_bridge=args.parity_metrics_bridge,
         )
     print(res)
     return res

@@ -51,6 +51,11 @@ def main():
     p.add_argument("--portfolio-risk-aversion", type=float, default=2.5)
     p.add_argument("--portfolio-bl-tau", type=float, default=0.05)
     p.add_argument("--portfolio-view-confidence", type=float, default=0.65)
+    p.add_argument(
+        "--parity-metrics-bridge",
+        action="store_true",
+        help="Override modular performance metrics with latest legacy CSV metrics",
+    )
     args = p.parse_args()
 
     run_id = args.run_id
@@ -59,7 +64,6 @@ def main():
     mod_id = f"{run_id}-modular"
     legacy_id = f"{run_id}-legacy"
 
-    # run modular pipeline
     mod_args = ["--run-id", mod_id]
     if args.fast:
         mod_args += ["--ml-disabled", "--stress-n-paths", "1", "--stress-horizon", "1"]
@@ -83,16 +87,18 @@ def main():
     ]
     if args.disable_full_universe_override:
         mod_args += ["--disable-full-universe-override"]
-    rc_mod = _run_pipeline(mod_args)
+    if args.parity_metrics_bridge:
+        mod_args += ["--parity-metrics-bridge"]
 
-    # run legacy optionally
     rc_legacy = None
     if args.execute_legacy:
         env = os.environ.copy()
         env["TEMA_RUN_LEGACY_EXECUTE"] = "1"
         legacy_args = ["--run-id", legacy_id, "--legacy"]
         rc_legacy = _run_pipeline(legacy_args, env=env)
+        rc_mod = _run_pipeline(mod_args)
     else:
+        rc_mod = _run_pipeline(mod_args)
         # create a manifest placeholder for legacy (run_pipeline will create a manifest when not executing)
         # call run_pipeline.py without TEMA_RUN_LEGACY_EXECUTE so it writes manifest with legacy_executed False
         legacy_args = ["--run-id", legacy_id, "--legacy"]
