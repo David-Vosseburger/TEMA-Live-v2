@@ -181,6 +181,8 @@ def run_modular(
     effective_data_path = data_path
     if template_default_universe and effective_data_path is None:
         effective_data_path = "merged_d1"
+    effective_signal_fast_period = 3 if template_default_universe else 5
+    effective_signal_slow_period = 20
 
     cfg = BacktestConfig(
         stress_enabled=stress_enabled,
@@ -190,6 +192,8 @@ def run_modular(
         modular_data_signals_enabled=modular_data_signals_enabled,
         portfolio_modular_enabled=modular_portfolio_enabled,
         data_path=effective_data_path,
+        signal_fast_period=effective_signal_fast_period,
+        signal_slow_period=effective_signal_slow_period,
         ml_enabled=ml_enabled,
         ml_modular_path_enabled=ml_modular_path_enabled,
         ml_probability_threshold=ml_probability_threshold,

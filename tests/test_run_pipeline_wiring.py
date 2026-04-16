@@ -74,6 +74,8 @@ def test_run_modular_template_default_universe_sets_profile_defaults(monkeypatch
     cfg = captured["cfg"]
     assert cfg.template_default_universe is True
     assert cfg.data_path == "merged_d1"
+    assert cfg.signal_fast_period == 3
+    assert cfg.signal_slow_period == 20
 
 
 def test_run_modular_template_default_universe_keeps_explicit_data_path(monkeypatch):
@@ -96,6 +98,8 @@ def test_run_modular_template_default_universe_keeps_explicit_data_path(monkeypa
     cfg = captured["cfg"]
     assert cfg.template_default_universe is True
     assert cfg.data_path == "custom_data"
+    assert cfg.signal_fast_period == 3
+    assert cfg.signal_slow_period == 20
 
 
 def test_main_passes_out_root_to_modular(monkeypatch):

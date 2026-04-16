@@ -118,9 +118,10 @@ def compute_backtest_metrics(
     mean_r = float(np.mean(r))
     std_r = float(np.std(r, ddof=0))
     annual_vol = std_r * float(np.sqrt(annualization_factor))
-    sharpe = 0.0 if std_r <= 1e-12 else mean_r / std_r * float(np.sqrt(annualization_factor))
     gross = float(np.prod(1.0 + r))
     annual_return = float(gross ** (annualization_factor / len(r)) - 1.0) if gross > 0 else -1.0
+    # Template semantics: Sharpe = annual_return / annual_vol (safe zero-vol guard)
+    sharpe = 0.0 if annual_vol <= 1e-12 else float(annual_return) / float(annual_vol)
     if e.size == 0:
         max_drawdown = 0.0
     else:

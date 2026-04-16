@@ -13,10 +13,12 @@ def test_run_return_equity_simulation_computes_core_metrics():
     target_weights = np.array([[1.0], [1.0], [1.0]], dtype=float)
     res = run_return_equity_simulation(asset_returns, target_weights, freq="D")
 
-    expected_sharpe = float(np.mean(asset_returns[:, 0]) / np.std(asset_returns[:, 0], ddof=0) * np.sqrt(252.0))
     expected_vol = float(np.std(asset_returns[:, 0], ddof=0) * np.sqrt(252.0))
     expected_equity = np.cumprod(1.0 + asset_returns[:, 0])
     expected_mdd = float(np.min(expected_equity / np.maximum.accumulate(expected_equity) - 1.0))
+    gross = float(np.prod(1.0 + asset_returns[:, 0]))
+    expected_annual_return = float(gross ** (252.0 / len(asset_returns[:, 0])) - 1.0) if gross > 0 else -1.0
+    expected_sharpe = 0.0 if expected_vol <= 1e-12 else float(expected_annual_return) / float(expected_vol)
 
     assert len(res.periodic_returns) == 3
     assert abs(res.metrics["sharpe"] - expected_sharpe) < 1e-10
@@ -52,3 +54,66 @@ def test_pipeline_includes_performance_artifact_with_fallback(tmp_path):
     assert performance["fallback_used"] is True
     for key in ("sharpe", "annual_return", "annual_vol", "max_drawdown", "annualized_turnover", "turnover_proxy"):
         assert key in performance
+
+
+def test_template_default_universe_enables_static_weight_schedule(monkeypatch):
+    import pandas as pd
+    from tema.pipeline.runner import _backtest_stage
+    from tema.backtest import run_return_equity_simulation
+
+    # Build a tiny deterministic price panel with 2 assets and 4 rows
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    price_df = pd.DataFrame(
+        {
+            "a": [100.0, 101.0, 102.0, 103.0],
+            "b": [100.0, 100.5, 101.0, 101.5],
+        },
+        index=idx,
+    )
+    train_df = price_df.iloc[:2]
+    test_df = price_df.iloc[2:]
+    train_returns = train_df.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0)
+
+    data_context = {
+        "price_df": price_df,
+        "train_df": train_df,
+        "test_df": test_df,
+        "train_returns": train_returns,
+        "max_assets_used": 2,
+        "full_universe_override": False,
+        "min_rows_used": 3,
+        "train_ratio_used": 0.5,
+    }
+
+    # final_weights start balanced between a and b
+    final_weights = [0.5, 0.5]
+
+    # Stub signal engine always favors asset 'b' so blended weights would differ
+    class StubEngine:
+        def generate(self, price_df, fast_period, slow_period, method):
+            df = pd.DataFrame({"a": [0.0, 0.0], "b": [1.0, 1.0]}, index=test_df.index)
+            return df
+
+    monkeypatch.setattr("tema.pipeline.runner.resolve_signal_engine", lambda use_cpp, cpp_engine=None: StubEngine())
+
+    from tema.config import BacktestConfig
+
+    # Case 1: template-default-universe -> static weights should be used
+    cfg_static = BacktestConfig(modular_data_signals_enabled=True, template_default_universe=True)
+    cfg_static.backtest_static_weights_in_template = True
+    perf_static = _backtest_stage(cfg_static, final_weights, [0.01, 0.02], data_context=data_context)
+
+    # Compute expected equity final using constant weight schedule (no signals)
+    returns_np = test_df.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0).to_numpy(dtype=float)
+    const_weights = np.tile(np.asarray(final_weights, dtype=float), (returns_np.shape[0], 1))
+    sim_const = run_return_equity_simulation(asset_returns=returns_np, target_weights=const_weights, freq="D")
+
+    assert abs(perf_static["equity_final"] - float(sim_const.equity_curve[-1])) < 1e-12
+
+    # Case 2: non-template mode -> signal-derived blending should alter weights
+    cfg_dyn = BacktestConfig(modular_data_signals_enabled=True, template_default_universe=False)
+    cfg_dyn.backtest_static_weights_in_template = False
+    perf_dyn = _backtest_stage(cfg_dyn, final_weights, [0.01, 0.02], data_context=data_context)
+
+    # Expect the dynamic case to differ from the constant case because StubEngine favors 'b'
+    assert abs(perf_dyn["equity_final"] - float(sim_const.equity_curve[-1])) > 1e-6

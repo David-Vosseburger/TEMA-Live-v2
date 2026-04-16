@@ -155,7 +155,12 @@ def _backtest_stage(
             raise ValueError("test returns panel is empty")
 
         weights_path = _constant_weight_schedule(final_weights, len(returns_df))
-        if cfg.modular_data_signals_enabled:
+        # If modular signals are enabled, the default behavior is to derive a
+        # per-period schedule from signals and blend with the base final weights.
+        # For template-default-universe parity, a config flag can force a static
+        # final_weights schedule to reduce execution-path mismatch. This keeps the
+        # conditional localized and wired through BacktestConfig.
+        if cfg.modular_data_signals_enabled and not getattr(cfg, "backtest_static_weights_in_template", False):
             engine = resolve_signal_engine(use_cpp=cfg.signal_use_cpp, cpp_engine=None)
             history_df = price_df.loc[: test_df.index[-1]]
             signal_df = engine.generate(
@@ -248,7 +253,8 @@ def _portfolio_stage(
                 method = "hrp"
             elif cfg.portfolio_use_nco_hook:
                 method = "nco"
-            if cfg.portfolio_modular_enabled:
+            use_modular_portfolio = bool(cfg.portfolio_modular_enabled and not cfg.template_default_universe)
+            if use_modular_portfolio:
                 alloc = allocate_portfolio_weights(
                     expected_alphas=expected_alphas,
                     returns_window=train_returns.to_numpy(dtype=float),
@@ -290,6 +296,7 @@ def _portfolio_stage(
                 "data_min_rows_used": int(ctx["min_rows_used"]),
                 "data_train_ratio_used": float(ctx["train_ratio_used"]),
                 "portfolio_modular_enabled": bool(cfg.portfolio_modular_enabled),
+                "portfolio_modular_effective": use_modular_portfolio,
                 "portfolio_method": portfolio_method,
                 "portfolio_allocation_fallback_used": portfolio_alloc_fallback,
                 "portfolio_diagnostics": portfolio_alloc_diag,
@@ -475,6 +482,10 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         run_id = datetime.utcnow().strftime("run-%Y%m%dT%H%M%SZ")
     if cfg is None:
         cfg = BacktestConfig()
+    # Wire template-default-universe to backtest static-weight behavior by default.
+    # This is a configuration-level wiring (flag) to avoid ad-hoc conditionals.
+    if cfg.template_default_universe:
+        cfg.backtest_static_weights_in_template = True
 
     # sanitize run_id to avoid path traversal
     import re as _re

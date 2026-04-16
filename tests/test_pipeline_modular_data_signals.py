@@ -184,6 +184,9 @@ def test_pipeline_template_default_universe_applies_template_data_profile(tmp_pa
     assert portfolio_info["data_min_rows_used"] == 400
     assert portfolio_info["data_train_ratio_used"] == 0.60
     assert portfolio_info["full_universe_override"] is True
+    assert portfolio_info["portfolio_modular_enabled"] is True
+    assert portfolio_info["portfolio_modular_effective"] is False
+    assert portfolio_info["portfolio_method"] == "legacy-signal-normalization"
     assert portfolio_info["assets"] == ["long"]
     assert performance["source"]["train_rows"] == 300
     assert performance["source"]["test_rows"] == 200

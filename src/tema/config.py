@@ -84,6 +84,11 @@ class BacktestConfig:
 
     # Generic
     freq: str = "D"
-    
+
+    # When True, and template_default_universe is enabled, the backtest will
+    # use a constant final_weights schedule instead of daily signal-derived
+    # reweight blending. This reduces execution-path mismatch vs Template.
+    backtest_static_weights_in_template: bool = False
+
     def total_cost_rate(self) -> float:
         return float(self.fee_rate + self.slippage_rate)
