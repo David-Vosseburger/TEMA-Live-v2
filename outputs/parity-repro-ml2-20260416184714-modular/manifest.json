@@ -1,0 +1,16 @@
+{
+  "run_id": "parity-repro-ml2-20260416184714-modular",
+  "timestamp": "2026-04-16T16:49:52.389827Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

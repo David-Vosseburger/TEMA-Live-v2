@@ -1,0 +1,20 @@
+{
+  "run_a": {
+    "sharpe": 1.1937301195130725,
+    "annual_return": 0.13331045169298528,
+    "annual_volatility": 0.11167553663416248,
+    "max_drawdown": -0.15792646759516754
+  },
+  "run_b": {
+    "sharpe": 1.1937301195130725,
+    "annual_return": 0.13331045169298528,
+    "annual_volatility": 0.11167553663416248,
+    "max_drawdown": -0.15792646759516754
+  },
+  "diff": {
+    "sharpe": 0.0,
+    "annual_return": 0.0,
+    "annual_volatility": 0.0,
+    "max_drawdown": 0.0
+  }
+}

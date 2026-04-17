@@ -1,0 +1,16 @@
+{
+  "run_id": "sweep-src-002",
+  "timestamp": "2026-04-16T16:33:01.915140Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

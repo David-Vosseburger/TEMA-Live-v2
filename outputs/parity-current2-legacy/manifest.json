@@ -1,0 +1,7 @@
+{
+  "run_id": "parity-current2-legacy",
+  "legacy_executed": true,
+  "artifacts": [
+    "performance"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "run_id": "parity-baseline-20260416-155012-modular",
+  "timestamp": "2026-04-16T13:50:12.873673Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

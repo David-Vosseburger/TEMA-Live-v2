@@ -117,3 +117,88 @@ def test_scaling_stage_uses_realized_vol_proxy():
         train_returns_window=high_vol_train,
     )
     assert sum(abs(x) for x in low_out) > sum(abs(x) for x in high_out)
+
+
+def test_scaling_stage_template_default_applies_vol_target_without_ml_flag():
+    cfg = BacktestConfig(
+        modular_data_signals_enabled=True,
+        template_default_universe=True,
+        vol_target_enabled=True,
+        vol_target_apply_to_ml=False,
+        vol_target_annual=0.10,
+        vol_target_min_leverage=0.25,
+        vol_target_max_leverage=12.0,
+    )
+    out = pipeline_runner._scaling_stage(
+        weights=[0.5, 0.5],
+        ml_info={},
+        cfg=cfg,
+        train_returns_window=np.array(
+            [
+                [0.03, -0.02],
+                [-0.02, 0.03],
+                [0.025, -0.03],
+                [-0.03, 0.02],
+            ],
+            dtype=float,
+        ),
+    )
+    assert abs(sum(abs(x) for x in out) - 1.0) > 1e-6
+
+
+def test_scaling_stage_emits_vol_target_diagnostics():
+    cfg = BacktestConfig(
+        modular_data_signals_enabled=True,
+        template_default_universe=True,
+        vol_target_enabled=True,
+        vol_target_apply_to_ml=False,
+        vol_target_annual=0.10,
+    )
+    ml_info = {}
+    pipeline_runner._scaling_stage(
+        weights=[0.5, 0.5],
+        ml_info=ml_info,
+        cfg=cfg,
+        train_returns_window=np.array(
+            [
+                [0.03, -0.02],
+                [-0.02, 0.03],
+                [0.025, -0.03],
+                [-0.03, 0.02],
+            ],
+            dtype=float,
+        ),
+    )
+
+    diag = ml_info["vol_target"]
+    assert diag["applied"] is True
+    assert diag["mode"] == "template_default_parity"
+    assert diag["proxy_fallback_used"] is False
+
+
+def test_scaling_stage_keeps_legacy_ml_gating_outside_template_default():
+    cfg = BacktestConfig(
+        modular_data_signals_enabled=True,
+        template_default_universe=False,
+        vol_target_enabled=True,
+        vol_target_apply_to_ml=False,
+        vol_target_annual=0.10,
+    )
+    ml_info = {}
+    out = pipeline_runner._scaling_stage(
+        weights=[0.5, 0.5],
+        ml_info=ml_info,
+        cfg=cfg,
+        train_returns_window=np.array(
+            [
+                [0.03, -0.02],
+                [-0.02, 0.03],
+                [0.025, -0.03],
+                [-0.03, 0.02],
+            ],
+            dtype=float,
+        ),
+    )
+    assert abs(sum(abs(x) for x in out) - 1.0) < 1e-12
+    assert ml_info["vol_target"]["applied"] is False
+    assert ml_info["vol_target"]["mode"] == "ml_opt_in_required"

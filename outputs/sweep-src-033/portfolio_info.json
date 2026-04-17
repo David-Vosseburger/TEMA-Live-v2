@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "fallback_used": false,
+  "data_path": "merged",
+  "assets": [
+    "0005hkhkd_h1",
+    "0175hkhkd_h1",
+    "0386hkhkd_h1",
+    "0388hkhkd_h1",
+    "0700hkhkd_h1"
+  ],
+  "n_rows": 6146,
+  "train_rows": 4302,
+  "test_rows": 1844,
+  "data_max_assets_used": 5,
+  "full_universe_override": false,
+  "portfolio_modular_enabled": false,
+  "portfolio_method": "legacy-signal-normalization",
+  "portfolio_allocation_fallback_used": false,
+  "portfolio_diagnostics": {}
+}

@@ -117,3 +117,52 @@ def test_template_default_universe_enables_static_weight_schedule(monkeypatch):
 
     # Expect the dynamic case to differ from the constant case because StubEngine favors 'b'
     assert abs(perf_dyn["equity_final"] - float(sim_const.equity_curve[-1])) > 1e-6
+
+
+def test_template_backtest_uses_strategy_returns_without_double_costing():
+    import pandas as pd
+    from tema.pipeline.runner import _backtest_stage
+
+    idx = pd.date_range("2020-01-01", periods=5, freq="D")
+    price_df = pd.DataFrame(
+        {
+            "a": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "b": [50.0, 49.0, 48.0, 49.0, 50.0],
+        },
+        index=idx,
+    )
+    train_df = price_df.iloc[:3]
+    test_df = price_df.iloc[3:]
+    strategy_test_returns = pd.DataFrame(
+        {"a": [0.01, -0.005], "b": [0.02, 0.01]},
+        index=test_df.index,
+    )
+    train_returns = train_df.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0)
+    data_context = {
+        "price_df": price_df,
+        "train_df": train_df,
+        "test_df": test_df,
+        "train_returns": train_returns,
+        "test_strategy_returns": strategy_test_returns,
+        "strategy_returns_include_costs": True,
+        "split_mode": "per_asset",
+    }
+    cfg = BacktestConfig(
+        modular_data_signals_enabled=False,
+        template_default_universe=True,
+        fee_rate=0.02,
+        slippage_rate=0.03,
+    )
+    final_weights = [0.5, 0.5]
+    perf = _backtest_stage(cfg, final_weights, [0.01, 0.01], data_context=data_context)
+
+    expected = run_return_equity_simulation(
+        asset_returns=strategy_test_returns.to_numpy(dtype=float),
+        target_weights=np.tile(np.asarray(final_weights, dtype=float), (len(strategy_test_returns), 1)),
+        fee_rate=0.0,
+        slippage_rate=0.0,
+        freq="D",
+    )
+    assert abs(perf["equity_final"] - float(expected.equity_curve[-1])) < 1e-12
+    assert perf["source"]["returns_source"] == "strategy_test_returns"
+    assert perf["source"]["strategy_returns_include_costs"] is True

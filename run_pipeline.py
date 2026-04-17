@@ -157,7 +157,7 @@ def run_modular(
     stress_n_paths: int = 200,
     stress_horizon: int = 20,
     modular_data_signals_enabled: bool = False,
-    modular_portfolio_enabled: bool = False,
+    modular_portfolio_enabled: bool | None = None,
     data_path: str | None = None,
     ml_enabled: bool = True,
     ml_modular_path_enabled: bool = False,
@@ -178,6 +178,16 @@ def run_modular(
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
 
+    # If template_default_universe is requested and the caller did not explicitly
+    # enable/disable modular portfolio (modular_portfolio_enabled is None), then
+    # default to the modular portfolio path. If the caller explicitly passed
+    # True/False, preserve that intent.
+    effective_portfolio_modular_enabled = (
+        modular_portfolio_enabled
+        if modular_portfolio_enabled is not None
+        else bool(template_default_universe)
+    )
+
     effective_data_path = data_path
     if template_default_universe and effective_data_path is None:
         effective_data_path = "merged_d1"
@@ -190,7 +200,7 @@ def run_modular(
         stress_n_paths=stress_n_paths,
         stress_horizon=stress_horizon,
         modular_data_signals_enabled=modular_data_signals_enabled,
-        portfolio_modular_enabled=modular_portfolio_enabled,
+        portfolio_modular_enabled=effective_portfolio_modular_enabled,
         data_path=effective_data_path,
         signal_fast_period=effective_signal_fast_period,
         signal_slow_period=effective_signal_slow_period,
@@ -229,7 +239,7 @@ def main(argv=None):
     p.add_argument("--stress-n-paths", type=int, default=200)
     p.add_argument("--stress-horizon", type=int, default=20)
     p.add_argument("--modular-data-signals", action="store_true")
-    p.add_argument("--modular-portfolio", action="store_true")
+    p.add_argument("--modular-portfolio", action="store_true", default=None)
     p.add_argument("--data-path", default=None)
     p.add_argument("--ml-disabled", action="store_true")
     p.add_argument("--ml-modular-path", action="store_true")

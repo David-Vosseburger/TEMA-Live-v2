@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "fallback_used": false,
+  "data_path": null,
+  "assets": [
+    "0005hkhkd",
+    "0175hkhkd",
+    "0386hkhkd",
+    "0388hkhkd",
+    "0700hkhkd"
+  ],
+  "n_rows": 986,
+  "train_rows": 690,
+  "test_rows": 296,
+  "data_max_assets_used": 5,
+  "full_universe_override": false,
+  "portfolio_modular_enabled": true,
+  "portfolio_method": "black_litterman_like",
+  "portfolio_allocation_fallback_used": false,
+  "portfolio_diagnostics": {
+    "n_assets": 5,
+    "sum_weights": 1.0,
+    "min_weight": 0.0,
+    "max_weight": 1.0
+  }
+}

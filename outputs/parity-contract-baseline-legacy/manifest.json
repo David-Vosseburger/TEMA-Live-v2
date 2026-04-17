@@ -1,0 +1,7 @@
+{
+  "run_id": "parity-contract-baseline-legacy",
+  "legacy_executed": true,
+  "artifacts": [
+    "performance"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "sharpe": 0.29535939186222265,
+  "annual_return": 0.011400702840238974,
+  "annual_vol": 0.04126258942940335,
+  "max_drawdown": -0.0730255202289326,
+  "annualized_turnover": 0.0,
+  "turnover_proxy": 0.0,
+  "periods": 550,
+  "equity_final": 1.0250503325882372,
+  "fallback_used": false,
+  "source": {
+    "mode": "historical_test_data",
+    "rows": 550,
+    "train_rows": 1295,
+    "test_rows": 555,
+    "assets": [
+      "0005hkhkd_h1",
+      "0175hkhkd_h1",
+      "0386hkhkd_h1"
+    ]
+  }
+}

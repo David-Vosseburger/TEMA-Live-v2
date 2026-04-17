@@ -4,10 +4,11 @@ from ..turnover import apply_rebalance_gating
 from ..ensemble import DynamicEnsembleConfig, combine_stream_signals, compute_dynamic_ensemble_weights
 from ..online_learning import OnlineLogisticLearner
 from ..stress import evaluate_stress_scenarios
-from ..data import load_price_panel, split_train_test
+from ..data import load_price_panel, split_train_test, split_panel_per_asset
 from ..signals import resolve_signal_engine
 from ..portfolio import allocate_portfolio_weights
 from ..backtest import build_weight_schedule_from_signals, run_return_equity_simulation
+from ..strategy_returns import build_strategy_returns
 from ..ml import (
     compute_position_scalars,
     score_regime_probabilities,
@@ -18,6 +19,7 @@ import json
 import os
 from datetime import datetime
 import numpy as np
+import pandas as pd
 
 
 def _annualization_factor(freq: str) -> float:
@@ -53,7 +55,17 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
         max_assets=max_assets,
         min_rows=max(3, min_rows),
     )
-    train_df, test_df = split_train_test(price_df, train_ratio=train_ratio)
+    split_mode = "global"
+    if cfg.template_default_universe:
+        train_df, test_df = split_panel_per_asset(
+            price_df,
+            train_ratio=train_ratio,
+            min_train_rows=2,
+            min_test_rows=1,
+        )
+        split_mode = "per_asset"
+    else:
+        train_df, test_df = split_train_test(price_df, train_ratio=train_ratio)
     if train_df.empty or test_df.empty:
         raise ValueError("train/test split produced empty partition")
     train_returns = (
@@ -62,11 +74,42 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
         .dropna(how="all")
         .fillna(0.0)
     )
+    strategy_returns_include_costs = bool(cfg.template_default_universe)
+    strategy_fee = cfg.fee_rate if strategy_returns_include_costs else 0.0
+    strategy_slippage = cfg.slippage_rate if strategy_returns_include_costs else 0.0
+    train_strategy_returns = (
+        build_strategy_returns(
+            train_df,
+            fast_period=cfg.signal_fast_period,
+            slow_period=cfg.signal_slow_period,
+            method=cfg.signal_method,
+            fee_rate=strategy_fee,
+            slippage_rate=strategy_slippage,
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    test_strategy_returns = (
+        build_strategy_returns(
+            test_df,
+            fast_period=cfg.signal_fast_period,
+            slow_period=cfg.signal_slow_period,
+            method=cfg.signal_method,
+            fee_rate=strategy_fee,
+            slippage_rate=strategy_slippage,
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
     return {
         "price_df": price_df,
         "train_df": train_df,
         "test_df": test_df,
         "train_returns": train_returns,
+        "train_strategy_returns": train_strategy_returns,
+        "test_strategy_returns": test_strategy_returns,
+        "strategy_returns_include_costs": strategy_returns_include_costs,
+        "split_mode": split_mode,
         "max_assets_used": max_assets,
         "full_universe_override": full_universe_override,
         "min_rows_used": int(max(3, min_rows)),
@@ -74,20 +117,34 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
     }
 
 
-def _vol_proxy_from_train_window(train_returns_window: Optional[np.ndarray], weights: Sequence[float], freq: str) -> float:
+def _vol_proxy_from_train_window(
+    train_returns_window: Optional[np.ndarray],
+    weights: Sequence[float],
+    freq: str,
+) -> tuple[float, bool, str]:
     if train_returns_window is None:
-        return 0.10
+        return 0.10, True, "missing_train_window"
     returns = np.asarray(train_returns_window, dtype=float)
     w = np.asarray(weights, dtype=float)
     if returns.ndim != 2 or returns.shape[0] == 0 or returns.shape[1] != len(w):
-        return 0.10
+        return 0.10, True, "shape_mismatch_or_empty"
     pnl = returns @ w
     if pnl.size == 0:
-        return 0.10
+        return 0.10, True, "empty_pnl"
     std = float(np.std(pnl, ddof=0))
     if std <= 1e-12:
-        return 0.10
-    return std * float(np.sqrt(_annualization_factor(freq)))
+        return 0.10, True, "near_zero_std"
+    return std * float(np.sqrt(_annualization_factor(freq))), False, "ok"
+
+
+def _should_apply_vol_target(cfg: BacktestConfig) -> tuple[bool, str]:
+    if not cfg.vol_target_enabled:
+        return False, "vol_target_disabled"
+    if cfg.vol_target_apply_to_ml:
+        return True, "ml_opt_in"
+    if cfg.template_default_universe and cfg.modular_data_signals_enabled:
+        return True, "template_default_parity"
+    return False, "ml_opt_in_required"
 
 
 def _blend_signal_schedule_with_base_weights(signal_schedule: np.ndarray, base_weights: Sequence[float]) -> np.ndarray:
@@ -145,12 +202,24 @@ def _backtest_stage(
         price_df = ctx["price_df"]
         train_df = ctx["train_df"]
         test_df = ctx["test_df"]
-        returns_df = (
-            test_df.pct_change(fill_method=None)
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna(how="all")
-            .fillna(0.0)
-        )
+        strategy_returns_include_costs = False
+        if cfg.template_default_universe and isinstance(ctx.get("test_strategy_returns"), pd.DataFrame):
+            returns_df = (
+                ctx["test_strategy_returns"]
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+                .fillna(0.0)
+            )
+            returns_source = "strategy_test_returns"
+            strategy_returns_include_costs = bool(ctx.get("strategy_returns_include_costs", False))
+        else:
+            returns_df = (
+                test_df.pct_change(fill_method=None)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+                .fillna(0.0)
+            )
+            returns_source = "buy_hold_pct_change"
         if returns_df.empty:
             raise ValueError("test returns panel is empty")
 
@@ -175,11 +244,13 @@ def _backtest_stage(
             if len(weights_path) != len(returns_df):
                 raise ValueError("signal-derived weights shape mismatch")
 
+        sim_fee = 0.0 if strategy_returns_include_costs else cfg.fee_rate
+        sim_slippage = 0.0 if strategy_returns_include_costs else cfg.slippage_rate
         sim = run_return_equity_simulation(
             asset_returns=returns_df.to_numpy(dtype=float),
             target_weights=weights_path,
-            fee_rate=cfg.fee_rate,
-            slippage_rate=cfg.slippage_rate,
+            fee_rate=sim_fee,
+            slippage_rate=sim_slippage,
             freq=cfg.freq,
         )
         return {
@@ -192,6 +263,9 @@ def _backtest_stage(
                 "train_rows": int(len(train_df)),
                 "test_rows": int(len(test_df)),
                 "assets": list(returns_df.columns),
+                "returns_source": returns_source,
+                "strategy_returns_include_costs": strategy_returns_include_costs,
+                "split_mode": ctx.get("split_mode", "global"),
             },
         }
     except Exception as exc:
@@ -233,6 +307,7 @@ def _portfolio_stage(
             train_df = ctx["train_df"]
             test_df = ctx["test_df"]
             train_returns = ctx["train_returns"]
+            train_strategy_returns = ctx.get("train_strategy_returns")
             engine = resolve_signal_engine(use_cpp=cfg.signal_use_cpp, cpp_engine=None)
             signal_df = engine.generate(
                 price_df=train_df,
@@ -241,8 +316,20 @@ def _portfolio_stage(
                 method=cfg.signal_method,
             )
             latest_signal = signal_df.iloc[-1].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            latest_ret = train_df.pct_change(fill_method=None).iloc[-1].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            expected_alphas = (latest_signal * latest_ret).to_numpy(dtype=float)
+            returns_window_df = train_returns
+            if cfg.template_default_universe and isinstance(train_strategy_returns, pd.DataFrame) and not train_strategy_returns.empty:
+                annual_factor = _annualization_factor(cfg.freq)
+                expected_alphas = (
+                    train_strategy_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0).mean(axis=0) * annual_factor
+                ).reindex(train_df.columns).fillna(0.0).to_numpy(dtype=float)
+                expected_alpha_source = "strategy_train_returns_annualized"
+                returns_window_df = train_strategy_returns
+            else:
+                latest_ret = train_df.pct_change(fill_method=None).iloc[-1].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                expected_alphas = (latest_signal * latest_ret).to_numpy(dtype=float)
+                expected_alpha_source = "latest_signal_x_latest_return"
+                if cfg.template_default_universe:
+                    expected_alpha_source = "latest_signal_x_latest_return_fallback"
             n_assets = int(expected_alphas.shape[0])
             if n_assets > 0:
                 current = [1.0 / n_assets for _ in range(n_assets)]
@@ -253,11 +340,11 @@ def _portfolio_stage(
                 method = "hrp"
             elif cfg.portfolio_use_nco_hook:
                 method = "nco"
-            use_modular_portfolio = bool(cfg.portfolio_modular_enabled and not cfg.template_default_universe)
+            use_modular_portfolio = bool(cfg.portfolio_modular_enabled)
             if use_modular_portfolio:
                 alloc = allocate_portfolio_weights(
                     expected_alphas=expected_alphas,
-                    returns_window=train_returns.to_numpy(dtype=float),
+                    returns_window=returns_window_df.to_numpy(dtype=float),
                     signals=latest_signal.to_numpy(dtype=float),
                     method=method,
                     risk_aversion=cfg.portfolio_risk_aversion,
@@ -300,7 +387,11 @@ def _portfolio_stage(
                 "portfolio_method": portfolio_method,
                 "portfolio_allocation_fallback_used": portfolio_alloc_fallback,
                 "portfolio_diagnostics": portfolio_alloc_diag,
-            }, train_returns.to_numpy(dtype=float)
+                "expected_alpha_source": expected_alpha_source,
+                "returns_window_source": "strategy_train_returns" if returns_window_df is train_strategy_returns else "buy_hold_pct_change_train",
+                "strategy_returns_include_costs": bool(ctx.get("strategy_returns_include_costs", False)),
+                "split_mode": ctx.get("split_mode", "global"),
+            }, returns_window_df.to_numpy(dtype=float)
         except Exception as exc:
             current = [0.30, 0.40, 0.30]
             candidate = [0.25, 0.45, 0.30]
@@ -389,14 +480,42 @@ def _scaling_stage(
             return list(scaled)
         return [x / base_total for x in baseline]
     normalized = [x / total for x in scaled]
-    if cfg.vol_target_enabled and cfg.vol_target_apply_to_ml:
+    apply_vol_target, vol_target_mode = _should_apply_vol_target(cfg)
+    vol_target_diag = {
+        "enabled": bool(cfg.vol_target_enabled),
+        "apply_to_ml": bool(cfg.vol_target_apply_to_ml),
+        "applied": False,
+        "mode": vol_target_mode,
+        "target_vol_annual": float(cfg.vol_target_annual),
+        "min_leverage": float(cfg.vol_target_min_leverage),
+        "max_leverage": float(cfg.vol_target_max_leverage),
+        "realized_vol_annual": None,
+        "leverage": 1.0,
+        "proxy_fallback_used": False,
+        "proxy_reason": None,
+    }
+    if apply_vol_target:
         target = max(float(cfg.vol_target_annual), 1e-6)
-        realized_vol = _vol_proxy_from_train_window(train_returns_window, normalized, cfg.freq)
+        realized_vol, proxy_fallback_used, proxy_reason = _vol_proxy_from_train_window(
+            train_returns_window,
+            normalized,
+            cfg.freq,
+        )
         leverage = max(
             cfg.vol_target_min_leverage,
             min(cfg.vol_target_max_leverage, target / max(realized_vol, 1e-6)),
         )
         normalized = [x * leverage for x in normalized]
+        vol_target_diag.update(
+            {
+                "applied": True,
+                "realized_vol_annual": float(realized_vol),
+                "leverage": float(leverage),
+                "proxy_fallback_used": bool(proxy_fallback_used),
+                "proxy_reason": str(proxy_reason),
+            }
+        )
+    ml_info["vol_target"] = vol_target_diag
     return normalized
 
 

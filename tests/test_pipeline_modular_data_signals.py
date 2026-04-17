@@ -185,8 +185,15 @@ def test_pipeline_template_default_universe_applies_template_data_profile(tmp_pa
     assert portfolio_info["data_train_ratio_used"] == 0.60
     assert portfolio_info["full_universe_override"] is True
     assert portfolio_info["portfolio_modular_enabled"] is True
-    assert portfolio_info["portfolio_modular_effective"] is False
-    assert portfolio_info["portfolio_method"] == "legacy-signal-normalization"
+    assert portfolio_info["portfolio_modular_effective"] is True
+    assert portfolio_info["portfolio_method"] in {"black_litterman_like", "mean_variance", "mean_variance_fallback"}
+    assert portfolio_info["expected_alpha_source"] == "strategy_train_returns_annualized"
+    assert portfolio_info["returns_window_source"] == "strategy_train_returns"
+    assert portfolio_info["split_mode"] == "per_asset"
     assert portfolio_info["assets"] == ["long"]
     assert performance["source"]["train_rows"] == 300
     assert performance["source"]["test_rows"] == 200
+    assert performance["source"]["rows"] == 200
+    assert performance["source"]["returns_source"] == "strategy_test_returns"
+    assert performance["source"]["strategy_returns_include_costs"] is True
+    assert performance["source"]["split_mode"] == "per_asset"

@@ -1,0 +1,16 @@
+{
+  "run_id": "parity-probe-20260416155807-modular",
+  "timestamp": "2026-04-16T13:58:45.031448Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

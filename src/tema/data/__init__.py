@@ -5,7 +5,7 @@ from .loader import (
     load_price_panel,
     resolve_data_dir,
 )
-from .splitter import split_train_test
+from .splitter import split_train_test, split_panel_per_asset
 
 __all__ = [
     "DEFAULT_DATA_CANDIDATES",
@@ -14,4 +14,5 @@ __all__ = [
     "load_close_series_from_csv",
     "load_price_panel",
     "split_train_test",
+    "split_panel_per_asset",
 ]

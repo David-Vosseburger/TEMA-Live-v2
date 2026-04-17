@@ -1,0 +1,7 @@
+{
+  "run_id": "parity-wave3-legacy",
+  "legacy_executed": true,
+  "artifacts": [
+    "performance"
+  ]
+}
