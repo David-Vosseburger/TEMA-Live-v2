@@ -178,7 +178,7 @@ def apply_hmm_softprob_rf_strategy(
     test_port_rets: pd.Series,
     cfg: BacktestConfig,
     hmm_engine,
-) -> Tuple[pd.Series, pd.Series, Dict[str, float], pd.DataFrame]:
+) -> Tuple[pd.Series, pd.Series, Dict[str, float], pd.DataFrame, Dict[str, object]]:
     tr = train_port_rets.fillna(0.0)
     te = test_port_rets.fillna(0.0)
 
@@ -258,8 +258,27 @@ def apply_hmm_softprob_rf_strategy(
     }
     diag.update({f"gate_{k}": float(v) for k, v in gate_diag.items()})
 
-    hmm_df = pd.DataFrame({"state": np.arange(int(cfg.hmm_n_states), dtype=int), "mean_return": means, "variance": variances})
-    return ml_train, ml_test, diag, hmm_df
+    bull_state = int(np.argmax(means)) if len(means) else 0
+    diag["bull_state"] = float(bull_state)
+
+    extras: Dict[str, object] = {
+        "bull_state": int(bull_state),
+        "hmm_bull_prob_train": np.asarray(train_probs[:, bull_state], dtype=float),
+        "hmm_bull_prob_test": np.asarray(test_probs[:, bull_state], dtype=float),
+        "rf_prob_train": np.asarray(p_train, dtype=float),
+        "rf_prob_test": np.asarray(p_test, dtype=float),
+        "scale_train": np.asarray(scale_train, dtype=float),
+        "scale_test": np.asarray(scale_test, dtype=float),
+    }
+
+    hmm_df = pd.DataFrame(
+        {
+            "state": np.arange(int(cfg.hmm_n_states), dtype=int),
+            "mean_return": means,
+            "variance": variances,
+        }
+    )
+    return ml_train, ml_test, diag, hmm_df, extras
 
 
 def compute_and_apply_ml_position_scalar(
@@ -564,11 +583,12 @@ def compute_template_ml_overlay(
     ml_test_rets = test_port_rets.copy()
     ml_diag: Dict[str, float] = {}
     hmm_state_df = pd.DataFrame()
+    ml_series: Dict[str, object] = {}
 
     selected_cfg = cfg
     if bool(getattr(cfg, "ml_enabled", False)):
         hmm_engine = hmm_engine or get_hmm_engine(prefer_cpp=True)
-        ml_train_rets, ml_test_rets, ml_diag, hmm_state_df = apply_hmm_softprob_rf_strategy(
+        ml_train_rets, ml_test_rets, ml_diag, hmm_state_df, ml_series = apply_hmm_softprob_rf_strategy(
             train_port_rets=train_port_rets,
             test_port_rets=test_port_rets,
             cfg=selected_cfg,
@@ -637,5 +657,36 @@ def compute_template_ml_overlay(
                 "portfolio_return_ml": scaled_ml_test.astype(float).tolist(),
             },
         }
+
+        # Optional extra time-series for reporting (regime-conditional stats)
+        if ml_series:
+            out["series"].update(
+                {
+                    "hmm_bull_prob_train": {
+                        "datetime": train_port_rets.index.astype(str).tolist(),
+                        "hmm_bull_prob": np.asarray(ml_series.get("hmm_bull_prob_train", []), dtype=float).tolist(),
+                    },
+                    "hmm_bull_prob_test": {
+                        "datetime": test_port_rets.index.astype(str).tolist(),
+                        "hmm_bull_prob": np.asarray(ml_series.get("hmm_bull_prob_test", []), dtype=float).tolist(),
+                    },
+                    "rf_prob_train": {
+                        "datetime": train_port_rets.index.astype(str).tolist(),
+                        "rf_prob": np.asarray(ml_series.get("rf_prob_train", []), dtype=float).tolist(),
+                    },
+                    "rf_prob_test": {
+                        "datetime": test_port_rets.index.astype(str).tolist(),
+                        "rf_prob": np.asarray(ml_series.get("rf_prob_test", []), dtype=float).tolist(),
+                    },
+                    "exposure_scale_train": {
+                        "datetime": train_port_rets.index.astype(str).tolist(),
+                        "exposure": np.asarray(ml_series.get("scale_train", []), dtype=float).tolist(),
+                    },
+                    "exposure_scale_test": {
+                        "datetime": test_port_rets.index.astype(str).tolist(),
+                        "exposure": np.asarray(ml_series.get("scale_test", []), dtype=float).tolist(),
+                    },
+                }
+            )
 
     return out

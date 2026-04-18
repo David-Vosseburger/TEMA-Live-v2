@@ -1271,6 +1271,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     }
     template_ml_overlay: dict = {"enabled": False}
     template_ml_meta_overlay: dict = {"enabled": False}
+    regime_report_info: dict = {"written": False}
 
     ctx = data_context
     if ctx is None and (cfg.modular_data_signals_enabled or cfg.template_default_universe):
@@ -1353,6 +1354,49 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                             returns_csv_info.update({"ml_written": True, "ml_path": ml_path})
                         else:
                             returns_csv_info["ml_error"] = "missing_ml_test_series"
+
+                        # Regime-conditional performance report (by HMM bull-state probability)
+                        try:
+                            hmm_prob = series.get("hmm_bull_prob_test")
+                            if (
+                                isinstance(hmm_prob, dict)
+                                and isinstance(hmm_prob.get("datetime"), list)
+                                and isinstance(hmm_prob.get("hmm_bull_prob"), list)
+                                and isinstance(series.get("base_test"), dict)
+                                and isinstance(series.get("ml_test"), dict)
+                            ):
+                                from ..reporting.regime_report import compute_regime_report, RegimeBinSpec
+
+                                idx = pd.to_datetime(hmm_prob["datetime"])
+                                prob = pd.Series(hmm_prob["hmm_bull_prob"], index=idx, dtype=float)
+
+                                base_idx = pd.to_datetime(series["base_test"]["datetime"])
+                                base_r = pd.Series(series["base_test"]["portfolio_return"], index=base_idx, dtype=float)
+
+                                ml_idx = pd.to_datetime(series["ml_test"]["datetime"])
+                                ml_r = pd.Series(series["ml_test"]["portfolio_return_ml"], index=ml_idx, dtype=float)
+
+                                ann = _annualization_factor(cfg.freq)
+                                spec = RegimeBinSpec()
+
+                                base_df = compute_regime_report(returns=base_r, regime_prob=prob, annualization_factor=ann, spec=spec)
+                                ml_df = compute_regime_report(returns=ml_r, regime_prob=prob, annualization_factor=ann, spec=spec)
+
+                                base_path = os.path.join(out_dir, "regime_report_base_test.csv")
+                                ml_path = os.path.join(out_dir, "regime_report_ml_test.csv")
+                                base_df.to_csv(base_path, index=False)
+                                ml_df.to_csv(ml_path, index=False)
+
+                                regime_report_info = {
+                                    "written": True,
+                                    "method": "hmm_bull_prob_cut",
+                                    "bins": list(spec.bins),
+                                    "labels": list(spec.labels),
+                                    "base_test_path": base_path,
+                                    "ml_test_path": ml_path,
+                                }
+                        except Exception as exc:
+                            regime_report_info = {"written": False, "error": str(exc)}
 
                         # Optional: ML_META overlay (Template/phase1_meta_overlay.py)
                         if bool(getattr(cfg, "ml_meta_overlay_enabled", False)):
@@ -1528,6 +1572,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         "returns_csv_info": returns_csv_info,
         "template_ml_overlay": template_ml_overlay,
         "template_ml_meta_overlay": template_ml_meta_overlay,
+        "regime_report_info": regime_report_info,
     }
     if cfg.stress_enabled:
         artifacts["stress_scenarios"] = evaluate_stress_scenarios(
