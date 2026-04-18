@@ -8,7 +8,7 @@ from ..data import load_price_panel, split_train_test, split_panel_per_asset
 from ..data.quality import DataQualityConfig, DataQualityFailed, compute_data_quality_report
 from ..signals import resolve_signal_engine
 from ..portfolio import allocate_portfolio_weights
-from ..backtest import build_weight_schedule_from_signals, run_return_equity_simulation
+from ..backtest import build_weight_schedule_from_signals, run_return_equity_simulation, compute_backtest_metrics
 from ..strategy_returns import (
     build_strategy_returns,
     build_train_test_strategy_returns_by_asset,
@@ -221,6 +221,82 @@ def _annualized_expected_alphas_from_strategy_train_returns(train_strategy_retur
     for col in train_strategy_returns.columns:
         out[str(col)] = _annualized_geometric_return(train_strategy_returns[col], annual_factor)
     return pd.Series(out, dtype=float)
+
+
+def _compute_overlay_test_metrics(returns: pd.Series, *, freq: str) -> dict:
+    clean = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    arr = clean.to_numpy(dtype=float)
+    eq = np.cumprod(1.0 + arr)
+    metrics = compute_backtest_metrics(arr, eq, np.zeros_like(arr), _annualization_factor(freq))
+    metrics["equity_final"] = float(eq[-1]) if eq.size else 1.0
+    metrics["total_return"] = float(eq[-1] - 1.0) if eq.size else 0.0
+    return metrics
+
+
+def _valid_overlay_metrics(metrics: object) -> dict | None:
+    if not isinstance(metrics, dict):
+        return None
+    required = ("sharpe", "annual_return", "annual_vol", "max_drawdown")
+    out: dict = {}
+    for key in required:
+        if key not in metrics:
+            return None
+        value = metrics.get(key)
+        if not isinstance(value, (int, float, np.floating)) or not np.isfinite(float(value)):
+            return None
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, np.floating)):
+            out[key] = float(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _promote_overlay_performance(
+    *,
+    performance: dict,
+    cfg: BacktestConfig,
+    template_ml_overlay: dict,
+    template_ml_meta_overlay: dict,
+    returns_csv_info: dict,
+) -> dict:
+    if not bool(getattr(cfg, "ml_template_overlay_enabled", False)):
+        return performance
+
+    promoted_metrics = None
+    promoted_source = None
+
+    if bool(getattr(cfg, "ml_meta_overlay_enabled", False)) and bool(template_ml_meta_overlay.get("enabled", False)):
+        promoted_metrics = _valid_overlay_metrics(template_ml_meta_overlay.get("test_metrics"))
+        if promoted_metrics is not None:
+            promoted_source = "template_ml_meta_overlay.test_metrics"
+
+    if promoted_metrics is None and bool(template_ml_overlay.get("enabled", False)):
+        promoted_metrics = _valid_overlay_metrics(template_ml_overlay.get("ml_test_metrics"))
+        if promoted_metrics is not None:
+            promoted_source = "template_ml_overlay.ml_test_metrics"
+
+    if promoted_metrics is None:
+        returns_csv_info["performance_overlay_promotion_error"] = "overlay_metrics_unavailable"
+        return performance
+
+    promoted = {**performance, **promoted_metrics}
+    source = promoted.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    source.update(
+        {
+            "mode": "historical_test_data_ml_overlay",
+            "overlay_derived": True,
+            "overlay_source": promoted_source,
+            "overlay_template_enabled": bool(getattr(cfg, "ml_template_overlay_enabled", False)),
+            "overlay_ml_meta_enabled": bool(getattr(cfg, "ml_meta_overlay_enabled", False)),
+        }
+    )
+    promoted["source"] = source
+    promoted["overlay_performance_promoted"] = True
+    promoted["overlay_performance_source"] = promoted_source
+    return promoted
 
 
 def _load_data_context(cfg: BacktestConfig) -> dict:
@@ -1464,10 +1540,18 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                             "ml_meta_benchmark_path": bench_test_src,
                                         }
                                     )
+                                    meta_test_metrics = _compute_overlay_test_metrics(
+                                        pd.Series(
+                                            bench_test_df["portfolio_return_ml_meta"].to_numpy(dtype=float),
+                                            index=pd.to_datetime(bench_test_df["datetime"], utc=True),
+                                        ),
+                                        freq=cfg.freq,
+                                    )
                                     template_ml_meta_overlay = {
                                         "enabled": True,
                                         "source": "benchmark_csv",
                                         "benchmark_path": bench_test_src,
+                                        "test_metrics": meta_test_metrics,
                                     }
 
                                     # Optional extras (only available when Template/ exists)
@@ -1584,7 +1668,13 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                             "ml_meta_source": "computed",
                                         }
                                     )
-                                    template_ml_meta_overlay = {"enabled": True, "source": "computed", **meta_diag}
+                                    meta_test_metrics = _compute_overlay_test_metrics(meta_test, freq=cfg.freq)
+                                    template_ml_meta_overlay = {
+                                        "enabled": True,
+                                        "source": "computed",
+                                        "test_metrics": meta_test_metrics,
+                                        **meta_diag,
+                                    }
                             except Exception as exc:
                                 returns_csv_info["ml_meta_error"] = str(exc)
                                 template_ml_meta_overlay = {"enabled": False, "error": str(exc)}
@@ -1595,6 +1685,17 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                     }
             except Exception as exc:
                 template_ml_overlay = {"enabled": False, "error": str(exc)}
+
+    try:
+        performance = _promote_overlay_performance(
+            performance=performance,
+            cfg=cfg,
+            template_ml_overlay=template_ml_overlay,
+            template_ml_meta_overlay=template_ml_meta_overlay,
+            returns_csv_info=returns_csv_info,
+        )
+    except Exception as exc:
+        returns_csv_info["performance_overlay_promotion_error"] = str(exc)
 
     # Stage 7: Reporting artifacts
     artifacts = {

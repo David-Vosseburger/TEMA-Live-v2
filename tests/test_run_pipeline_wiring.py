@@ -80,6 +80,11 @@ def test_run_modular_template_default_universe_sets_profile_defaults(monkeypatch
     assert cfg.data_path == "merged_d1"
     assert cfg.signal_fast_period == 3
     assert cfg.signal_slow_period == 20
+    # When template_default_universe is requested and ML is enabled by default,
+    # the wiring should default ml_template_overlay to True unless the caller
+    # explicitly set it. The meta overlay should remain off by default.
+    assert cfg.ml_template_overlay_enabled is True
+    assert cfg.ml_meta_overlay_enabled is False
 
 
 def test_run_modular_template_default_universe_keeps_explicit_data_path(monkeypatch):

@@ -161,8 +161,8 @@ def run_modular(
     data_path: str | None = None,
     ml_enabled: bool = True,
     ml_modular_path_enabled: bool = False,
-    ml_template_overlay: bool = False,
-    ml_meta_overlay: bool = False,
+    ml_template_overlay: bool | None = None,
+    ml_meta_overlay: bool | None = None,
     ml_probability_threshold: float = 0.0,
     data_max_assets: int = 3,
     data_full_universe_for_parity: bool = True,
@@ -196,6 +196,18 @@ def run_modular(
     effective_signal_fast_period = 3 if template_default_universe else 5
     effective_signal_slow_period = 20
 
+    # Determine ML overlay defaults with explicit-intent semantics:
+    # - If caller explicitly set ml_template_overlay (True/False), preserve it.
+    # - If not set (None) and template_default_universe is requested and ML is enabled,
+    #   default ml_template_overlay to True so template ML overlay is applied out-of-the-box.
+    # - ml_meta_overlay stays off by default unless explicitly requested.
+    effective_ml_template_overlay = (
+        ml_template_overlay
+        if ml_template_overlay is not None
+        else (True if template_default_universe and ml_enabled else False)
+    )
+    effective_ml_meta_overlay = ml_meta_overlay if ml_meta_overlay is not None else False
+
     cfg = BacktestConfig(
         stress_enabled=stress_enabled,
         stress_seed=stress_seed,
@@ -208,8 +220,8 @@ def run_modular(
         signal_slow_period=effective_signal_slow_period,
         ml_enabled=ml_enabled,
         ml_modular_path_enabled=ml_modular_path_enabled,
-        ml_template_overlay_enabled=ml_template_overlay,
-        ml_meta_overlay_enabled=ml_meta_overlay,
+        ml_template_overlay_enabled=effective_ml_template_overlay,
+        ml_meta_overlay_enabled=effective_ml_meta_overlay,
         ml_probability_threshold=ml_probability_threshold,
         data_max_assets=data_max_assets,
         data_full_universe_for_parity=data_full_universe_for_parity,
@@ -247,8 +259,8 @@ def main(argv=None):
     p.add_argument("--data-path", default=None)
     p.add_argument("--ml-disabled", action="store_true")
     p.add_argument("--ml-modular-path", action="store_true")
-    p.add_argument("--ml-template-overlay", action="store_true", help="Apply Template-like ML overlay in template_default_universe mode")
-    p.add_argument("--ml-meta-overlay", action="store_true", help="Apply Template phase1 meta overlay (ML_META) on top of ML overlay")
+    p.add_argument("--ml-template-overlay", action="store_true", default=None, help="Apply Template-like ML overlay in template_default_universe mode")
+    p.add_argument("--ml-meta-overlay", action="store_true", default=None, help="Apply Template phase1 meta overlay (ML_META) on top of ML overlay")
     p.add_argument("--ml-prob-threshold", type=float, default=0.0)
     p.add_argument("--data-max-assets", type=int, default=3)
     p.add_argument("--disable-full-universe-override", action="store_true")
