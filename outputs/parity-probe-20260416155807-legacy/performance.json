@@ -1,8 +1,0 @@
-{
-  "sharpe": 1.0173619268565903,
-  "annual_return": 0.10196257591781421,
-  "annual_volatility": 0.10022251985864525,
-  "max_drawdown": -0.13203627116591424,
-  "legacy_dataset": "test",
-  "legacy_metrics_source": "/home/davidv/Dokumente/Offen/TEMA-Live-v2/Template/bl_portfolio_metrics.csv"
-}
