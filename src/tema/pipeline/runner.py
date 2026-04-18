@@ -1599,6 +1599,27 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     with open(mf_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
+    # Best-effort: append run to monitoring ledger (SQLite)
+    try:
+        if bool(getattr(cfg, "monitoring_ledger_enabled", False)):
+            from ..reporting.ledger import append_run_to_ledger
+
+            ledger_path = getattr(cfg, "monitoring_ledger_path", None) or os.path.join(out_root, "tema_ledger.sqlite")
+            append_run_to_ledger(
+                ledger_path=str(ledger_path),
+                run_id=str(run_id),
+                timestamp=str(manifest.get("timestamp", "")),
+                out_dir=str(out_dir),
+                cfg=cfg,
+                performance=performance,
+                extra={
+                    "template_ml_overlay_enabled": bool(getattr(cfg, "ml_template_overlay_enabled", False)),
+                    "ml_meta_overlay_enabled": bool(getattr(cfg, "ml_meta_overlay_enabled", False)),
+                },
+            )
+    except Exception:
+        pass
+
     return {"manifest_path": mf_path, "out_dir": out_dir, "manifest": manifest}
 
 

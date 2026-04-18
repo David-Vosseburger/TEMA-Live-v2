@@ -139,6 +139,10 @@ class BacktestConfig:
     # Generic
     freq: str = "D"
 
+    # Monitoring / run ledger
+    monitoring_ledger_enabled: bool = False
+    monitoring_ledger_path: Optional[str] = None
+
     # When True, and template_default_universe is enabled, the backtest will
     # use a constant final_weights schedule instead of daily signal-derived
     # reweight blending. This reduces execution-path mismatch vs Template.
