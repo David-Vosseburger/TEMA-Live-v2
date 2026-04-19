@@ -61,21 +61,37 @@ def _exposure_from_pred(pred: np.ndarray, k: float, floor: float) -> np.ndarray:
     )
 
 
-def _compute_metrics_arithmetic(returns: pd.Series, freq: int = 252) -> Dict[str, float]:
-    r = returns.fillna(0.0)
+def _compute_metrics_arithmetic(returns: pd.Series, freq: int = 252, risk_free_rate: float = 0.0) -> Dict[str, float]:
+    """Compute geometric annual return and volatility-compatible Sharpe.
+
+    Aligns semantics with compute_backtest_metrics: geometric annual return,
+    population std (ddof=0) for periodic returns and Sharpe = annual_return / annual_vol.
+    """
+    r = pd.to_numeric(returns.fillna(0.0), errors="coerce").astype(float)
+    n = int(len(r))
+    if n == 0:
+        return {
+            "total_return": 0.0,
+            "annualized_return": 0.0,
+            "annualized_vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
     cumulative = (1.0 + r).cumprod()
-    total_return = float(cumulative.iloc[-1] - 1.0) if len(cumulative) else 0.0
-    mean_ret = float(r.mean()) if len(r) else 0.0
-    vol = float(r.std()) if len(r) else 0.0
-    ann_ret = mean_ret * float(freq)
-    ann_vol = vol * math.sqrt(float(freq))
-    sharpe = (mean_ret / vol) * math.sqrt(float(freq)) if vol > 0 else 0.0
-    running_max = cumulative.cummax() if len(cumulative) else cumulative
-    drawdown = (cumulative - running_max) / running_max if len(cumulative) else cumulative
-    max_dd = float(drawdown.min()) if len(drawdown) else 0.0
+    total_return = float(cumulative.iloc[-1] - 1.0)
+    # population std (ddof=0) to match backtest.compute_backtest_metrics
+    std_r = float(np.std(r.to_numpy(dtype=float), ddof=0))
+    ann_vol = std_r * math.sqrt(float(freq)) if std_r > 0 else 0.0
+    gross = float(np.prod(1.0 + r))
+    annualized_return = float(gross ** (float(freq) / float(n)) - 1.0) if gross > 0 else -1.0
+    sharpe = 0.0 if ann_vol <= 1e-12 else (float(annualized_return) - float(risk_free_rate)) / float(ann_vol)
+    running_max = cumulative.cummax()
+    # drawdown computed as equity / running_max - 1 to match backtest
+    drawdown = cumulative / running_max - 1.0
+    max_dd = float(drawdown.min())
     return {
         "total_return": float(total_return),
-        "annualized_return": float(ann_ret),
+        "annualized_return": float(annualized_return),
         "annualized_vol": float(ann_vol),
         "sharpe": float(sharpe),
         "max_drawdown": float(max_dd),
@@ -245,16 +261,27 @@ def compute_ml_meta_overlay_series(
     train_ml_ann_vol = float(train_ml_metrics["annualized_vol"])
 
     def evaluate_candidate(expo: np.ndarray, series_vals: np.ndarray) -> Dict[str, float]:
-        r = pd.Series(series_vals * expo)
+        # clean inputs consistently
+        r = pd.to_numeric(pd.Series(series_vals * expo).fillna(0.0), errors="coerce").astype(float)
         n = len(r)
         mean = float(r.mean()) if n else 0.0
-        std = float(r.std()) if n else 0.0
+        # population std (ddof=0) for compatibility with backtest
+        std = float(np.std(r.to_numpy(dtype=float), ddof=0)) if n else 0.0
         ann_vol = std * math.sqrt(252.0) if std > 0 else 0.0
-        ann_ret = mean * 252.0
-        sharpe = (mean / std) * math.sqrt(252.0) if std > 0 else 0.0
+        # geometric annual return with log-sum for numeric stability
+        total_return = float((1.0 + r).cumprod().iloc[-1] - 1.0) if n else 0.0
+        one_plus = 1.0 + r.to_numpy(dtype=float) if n else np.array([], dtype=float)
+        if n and np.all(one_plus > 0.0):
+            logsum = float(np.sum(np.log1p(r.to_numpy(dtype=float))))
+            ann_ret = float(math.exp(logsum * (252.0 / float(n))) - 1.0)
+        elif n:
+            # follow backtest semantics: non-positive gross -> annualized return = -1.0
+            ann_ret = -1.0
+        else:
+            ann_ret = 0.0
+        sharpe = (ann_ret / ann_vol) if ann_vol > 0 else 0.0
         turnover_per_year = float(np.mean(np.abs(np.diff(expo)))) * 252.0 if n > 1 else 0.0
         mean_abs_exposure = float(np.mean(np.abs(expo))) if n else 0.0
-        total_return = float((1.0 + r).cumprod().iloc[-1] - 1.0) if n else 0.0
         return {
             "mean": float(mean),
             "std": float(std),
